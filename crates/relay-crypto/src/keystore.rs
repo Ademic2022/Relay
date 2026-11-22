@@ -62,3 +62,48 @@ mod tests {
         assert_eq!(a.public_bytes(), b.public_bytes());
     }
 }
+
+/// The OS secret store: macOS Keychain, Windows Credential Manager (FR-1).
+#[cfg(feature = "os-keystore")]
+#[derive(Debug, Clone)]
+pub struct OsKeystore {
+    service: String,
+}
+
+#[cfg(feature = "os-keystore")]
+impl OsKeystore {
+    /// `service` separates installations (e.g. "relay", "relay-dev").
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    fn entry(&self, name: &str) -> Result<keyring::Entry, CryptoError> {
+        keyring::Entry::new(&self.service, name).map_err(|e| CryptoError::Keystore(e.to_string()))
+    }
+}
+
+#[cfg(feature = "os-keystore")]
+impl Keystore for OsKeystore {
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>, CryptoError> {
+        match self.entry(name)?.get_secret() {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(CryptoError::Keystore(e.to_string())),
+        }
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), CryptoError> {
+        self.entry(name)?
+            .set_secret(secret)
+            .map_err(|e| CryptoError::Keystore(e.to_string()))
+    }
+
+    fn delete(&self, name: &str) -> Result<(), CryptoError> {
+        match self.entry(name)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(CryptoError::Keystore(e.to_string())),
+        }
+    }
+}

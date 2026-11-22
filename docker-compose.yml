@@ -1,0 +1,14 @@
+services:
+  relay-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "21116:21116/udp"
+      - "21117:21117/udp"
+    volumes:
+      - relay-data:/data
+    # Peers must be told the relay's public address if it differs from the
+    # rendezvous address they connect to:
+    # command: ["--public-relay", "203.0.113.10:21117"]
+volumes:
+  relay-data:

@@ -15,8 +15,8 @@ use anyhow::{Context, bail};
 use relay_codec::{DecodedFrame, Decoder};
 use relay_net::quic;
 use relay_net::video::{CompleteFrame, Reassembler};
+use relay_proto::MAX_MESSAGE_LEN;
 use relay_proto::v1::{self, control_message::Msg};
-use relay_proto::{MAX_MESSAGE_LEN, PROTOCOL_VERSION};
 use relay_session::latest;
 use tokio::sync::mpsc as tmpsc;
 
@@ -66,15 +66,17 @@ pub struct HostInfo {
 
 #[derive(Debug, Clone)]
 pub struct ViewOptions {
-    pub addr: SocketAddr,
-    pub code: String,
+    pub target: Target,
+    pub password: String,
+    pub force_relay: bool,
     pub measure: bool,
     pub cmd_ctrl_swap: bool,
     pub translate_chars: bool,
 }
 
 pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
-    let ViewOptions { addr, code, .. } = opts.clone();
+    let target = opts.target.clone();
+    let opts2 = opts.clone();
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let (frame_tx, frame_rx) = latest::channel::<DecodedFrame>();
@@ -84,7 +86,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
             ..Default::default()
         }),
         frames: frame_rx,
-        host_name: Mutex::new(addr.to_string()),
+        host_name: Mutex::new(target.to_string()),
         host: Mutex::new(HostInfo::default()),
     });
     let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
@@ -109,8 +111,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
                     }
                 };
                 let res = rt.block_on(network(
-                    addr,
-                    code,
+                    opts2,
                     frame_tx,
                     proxy.clone(),
                     shared,
@@ -134,75 +135,136 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where to connect.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// FR-7: direct IP, no rendezvous.
+    Direct(SocketAddr),
+    /// By Device ID through the rendezvous server.
+    Id {
+        id: relay_crypto::DeviceId,
+        server: crate::rdv::Server,
+    },
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Direct(a) => write!(f, "{a}"),
+            Target::Id { id, .. } => write!(f, "{id}"),
+        }
+    }
+}
+
+impl Target {
+    /// Name under which the host key is pinned (FR-5).
+    pub fn pin_name(&self) -> String {
+        match self {
+            Target::Direct(a) => a.to_string(),
+            Target::Id { id, .. } => id.as_u32().to_string(),
+        }
+    }
+}
+
+/// A connected, key-verified (not yet password-authenticated) session.
+pub struct Established {
+    /// Owns the UDP socket; must outlive the connection.
+    pub node: relay_net::quic::Node,
+    pub conn: quinn::Connection,
+    pub path: crate::rdv::Path,
+    pub hub: crate::rdv::ControlHub,
+    /// Set when relayed: what to probe for a direct path (FR-4).
+    pub relay: Option<crate::rdv::Expected>,
+}
+
+pub async fn establish(
+    me: &crate::identity::Me,
+    target: &Target,
+    force_relay: bool,
+) -> anyhow::Result<Established> {
+    let (node, control) = quic::node(SocketAddr::from(([0, 0, 0, 0], 0)), &me.tls, None)?;
+    let hub = crate::rdv::ControlHub::spawn(control);
+    let (conn, path, relay) = match target {
+        Target::Direct(addr) => {
+            let (cfg, _) = quic::client_config(
+                &me.tls,
+                relay_net::tls::Expect::AnyRecord,
+                quic::ALPN,
+                Duration::from_secs(2),
+            )?;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(5),
+                quic::connect(&node.endpoint, cfg, *addr),
+            )
+            .await
+            .with_context(|| {
+                format!("no answer from {addr} (is `relay host` running and reachable?)")
+            })??;
+            (conn, crate::rdv::Path::Direct, None)
+        }
+        Target::Id { id, server } => {
+            crate::rdv::connect_by_id(&node, &hub, me, server, *id, force_relay).await?
+        }
+    };
+    let key = relay_net::tls::peer_public_key(&conn).context("host presented no device key")?;
+    let name = target.pin_name();
+    match crate::pins::check(&name, &key) {
+        relay_crypto::PinCheck::Match => {}
+        relay_crypto::PinCheck::New => {
+            tracing::info!(
+                "first connection to {target}; remembering its key {}",
+                relay_net::hex(&key)
+            );
+            crate::pins::pin(&name, &key);
+        }
+        relay_crypto::PinCheck::Changed => {
+            conn.close(1u32.into(), b"key changed");
+            bail!(
+                "WARNING: the device key of {target} has changed since you last connected.\n\
+                 It may have been reinstalled, or someone may be impersonating it.\n\
+                 If you trust the change, run `relay forget {name}` and connect again."
+            );
+        }
+    }
+    tracing::info!("connected to {target} ({})", path.label());
+    Ok(Established {
+        node,
+        conn,
+        path,
+        hub,
+        relay,
+    })
+}
+
 fn control(msg: Msg) -> v1::ControlMessage {
     v1::ControlMessage { msg: Some(msg) }
 }
 
 async fn network(
-    addr: SocketAddr,
-    code: String,
+    ViewOptions {
+        target,
+        password,
+        force_relay,
+        ..
+    }: ViewOptions,
     frames_out: latest::Sender<DecodedFrame>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
     mut quit: tokio::sync::oneshot::Receiver<()>,
     mut input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
 ) -> anyhow::Result<String> {
-    let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {addr}…")));
-    let (ep, seen) = quic::client()?;
-    let conn = tokio::time::timeout(Duration::from_secs(5), quic::connect(&ep, addr))
-        .await
-        .with_context(|| {
-            format!("no answer from {addr} (is `relay host` running and reachable?)")
-        })??;
-    tracing::info!(
-        "connected to {addr}, host certificate {}",
-        seen.get().unwrap_or_default()
-    );
+    let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {}…", target)));
+    let me = crate::identity::load()?;
+    let est = establish(&me, &target, force_relay).await?;
+    let conn = est.conn.clone();
+    shared.stats.lock().expect("poisoned").path = est.path.label();
+    *shared.host_name.lock().expect("poisoned") = target.to_string();
     let (mut tx, mut rx) = conn.open_bi().await?;
-    let name = std::env::var("USER").unwrap_or_else(|_| "viewer".into());
-    quic::send_msg(
-        &mut tx,
-        &control(Msg::Hello(v1::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            device_name: name,
-            os: if cfg!(target_os = "macos") {
-                v1::OsKind::Macos
-            } else {
-                v1::OsKind::Windows
-            } as i32,
-            capabilities: Some(v1::Capabilities {
-                decoders: vec![v1::Codec::H264 as i32],
-                ..Default::default()
-            }),
-            ..Default::default()
-        })),
-    )
-    .await?;
-    quic::send_msg(
-        &mut tx,
-        &control(Msg::Auth(v1::AuthMessage {
-            step: 0,
-            payload: code.trim().as_bytes().to_vec().into(),
-        })),
-    )
-    .await?;
-
-    match quic::recv_msg::<v1::ControlMessage>(&mut rx, MAX_MESSAGE_LEN).await? {
-        Some(v1::ControlMessage {
-            msg: Some(Msg::AuthOutcome(o)),
-        }) => match v1::AuthResult::try_from(o.result).unwrap_or(v1::AuthResult::Unspecified) {
-            v1::AuthResult::Ok => {}
-            v1::AuthResult::BadPassword => bail!("wrong session code"),
-            v1::AuthResult::LockedOut => {
-                bail!(
-                    "too many attempts; try again in {} s",
-                    o.retry_after_ms.div_ceil(1000)
-                )
-            }
-            other => bail!("host refused the connection: {other:?}"),
-        },
-        _ => bail!("host closed the connection during authentication"),
-    }
+    let name = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "viewer".into());
+    let _ = proxy.send_event(UserEvent::Status("Waiting for the host to accept…".into()));
+    crate::auth::controller(&conn, &mut tx, &mut rx, &me, &name, &password).await?;
     let mut stream_cfg = None;
     while stream_cfg.is_none() {
         match quic::recv_msg::<v1::ControlMessage>(&mut rx, MAX_MESSAGE_LEN).await? {
@@ -317,7 +379,44 @@ async fn network(
             })?
     };
 
-    let host_closed = receive(&conn, dec_tx, &ctl_tx, &shared, &mut rx, &mut quit).await;
+    // Relayed: keep probing for a direct path and move the session onto
+    // it as soon as one answers (FR-4).
+    let switched = Arc::new(tokio::sync::Notify::new());
+    let migration = match est.relay.clone() {
+        Some(exp) => {
+            let mut prober =
+                crate::migrate::Prober::start(&est.node, &est.hub, &exp, &quic::exporter(&conn)?);
+            let paths = est.node.paths.clone();
+            let (ctl, shared, switched) = (ctl_tx.clone(), shared.clone(), switched.clone());
+            Some(tokio::spawn(async move {
+                let Some(direct) = prober.first_ack().await else {
+                    return;
+                };
+                crate::migrate::controller_prepare(&paths, exp.relay, direct);
+                loop {
+                    let _ = ctl.send(control(Msg::PathSwitch(v1::PathSwitch {})));
+                    tokio::select! {
+                        _ = switched.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+                crate::migrate::controller_commit(&paths, exp.relay, direct);
+                shared.stats.lock().expect("poisoned").path = "P2P (was relay)";
+                // Keep answering the host's probes for the rest of the session.
+                std::future::pending::<()>().await;
+                drop(prober);
+            }))
+        }
+        None => None,
+    };
+
+    let host_closed = receive(
+        &conn, dec_tx, &ctl_tx, &shared, &mut rx, &mut quit, &switched,
+    )
+    .await;
+    if let Some(m) = migration {
+        m.abort();
+    }
     let _ = ctl_tx.send(control(Msg::End(v1::SessionEnd {
         reason: v1::EndReason::ControllerLeft as i32,
         detail: String::new(),
@@ -328,7 +427,7 @@ async fn network(
     let _ = tokio::time::timeout(Duration::from_millis(300), writer).await;
     conn.close(0u32.into(), b"viewer closed");
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;
-    ep.wait_idle().await;
+    est.node.endpoint.wait_idle().await;
     Ok(host_closed)
 }
 
@@ -340,6 +439,7 @@ async fn receive(
     shared: &Shared,
     ctl_rx: &mut quinn::RecvStream,
     quit: &mut tokio::sync::oneshot::Receiver<()>,
+    switched: &tokio::sync::Notify,
 ) -> String {
     let mut reasm = Reassembler::new(REASSEMBLY_DEADLINE);
     let mut fb = Feedback::new();
@@ -396,6 +496,7 @@ async fn receive(
                         _ => "Session ended by host.".into(),
                     };
                 }
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::PathSwitched(_)) })) => switched.notify_one(),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return "host closed the connection".into(),
             },

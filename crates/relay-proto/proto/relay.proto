@@ -147,6 +147,11 @@ message PowerRequest {
 
 message SendSas {}
 
+// Relay → P2P switch (FR-4). The Controller found a direct path and asks
+// the Host to send to it; the Host confirms once it has switched.
+message PathSwitch {}
+message PathSwitched {}
+
 message ControlMessage {
   oneof msg {
     Hello hello = 1;
@@ -162,6 +167,8 @@ message ControlMessage {
     SessionEnd end = 11;
     PowerRequest power = 12;
     SendSas send_sas = 13;
+    PathSwitch path_switch = 14;
+    PathSwitched path_switched = 15;
   }
 }
 

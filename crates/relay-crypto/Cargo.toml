@@ -13,6 +13,16 @@ ed25519-dalek.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
+opaque-ke = { version = "4.0.1", features = ["argon2"] }
+sha2 = "0.10"
+# OsRng in the rand_core version opaque-ke 4 uses.
+rand_core = { version = "0.6", features = ["getrandom"] }
+keyring = { version = "4", optional = true }
+
+[features]
+default = ["os-keystore"]
+# Store the device key in the macOS Keychain / Windows Credential Manager.
+os-keystore = ["dep:keyring"]
 
 [lints]
 workspace = true

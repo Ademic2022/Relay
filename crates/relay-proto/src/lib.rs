@@ -18,6 +18,12 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/relay.v1.rs"));
 }
 
+/// Rendezvous protocol (§8.3).
+pub mod rdv {
+    #![allow(clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/relay.rdv.v1.rs"));
+}
+
 pub use prost::Message;
 
 /// Error decoding a message from the wire.

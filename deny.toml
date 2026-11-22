@@ -4,6 +4,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # crypto-bigint 0.5 timing issues, pulled in by elliptic-curve 0.13 via
+  # opaque-ke 4 / voprf. Relay uses the Ristretto255 suite, whose secret
+  # arithmetic is curve25519-dalek, not crypto-bigint (which backs only the
+  # NIST-curve types we do not enable). Revisit when opaque-ke ships a
+  # stable release on elliptic-curve >= 0.14 / crypto-bigint >= 0.7.6.
+  { id = "RUSTSEC-2026-0387", reason = "not on a secret-dependent path with the Ristretto255 suite" },
+]
 
 [licenses]
 version = 2

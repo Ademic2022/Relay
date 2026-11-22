@@ -1,0 +1,58 @@
+// Peer ↔ rendezvous server protocol, version 1 (§8.2, §8.3).
+//
+// Runs on one long-lived bidirectional QUIC stream per connection, over
+// mutual TLS: the server learns each peer's device key from its
+// certificate, so a peer cannot register or look up as someone else.
+syntax = "proto3";
+
+package relay.rdv.v1;
+
+message PeerInfo {
+  uint32 device_id = 1;
+  bytes public_key = 2;          // Ed25519, 32 bytes
+  string observed_addr = 3;      // as seen by the server ("ip:port")
+  repeated string local_addrs = 4;
+}
+
+// Host → server: make me reachable by my Device ID.
+message Register {
+  uint32 protocol_version = 1;
+  repeated string local_addrs = 2;
+}
+
+// Server → host.
+message Registered {
+  uint32 device_id = 1;
+  string observed_addr = 2;
+}
+
+// Controller → server: connect me to this Device ID.
+message Lookup {
+  uint32 target_id = 1;
+  repeated string local_addrs = 2;
+}
+
+// Server → controller.
+message LookupResult {
+  oneof result {
+    Rendezvous ok = 1;
+    string error = 2;
+  }
+}
+
+// Sent to both peers: whom to punch towards and the relay fallback.
+message Rendezvous {
+  PeerInfo peer = 1;
+  bytes token = 2;               // 16 bytes; pairs the two sides at the relay
+  string relay_addr = 3;         // "ip:port"
+}
+
+message Message {
+  oneof msg {
+    Register register = 1;
+    Registered registered = 2;
+    Lookup lookup = 3;
+    LookupResult lookup_result = 4;
+    Rendezvous incoming = 5;     // server → host: a controller is coming
+  }
+}

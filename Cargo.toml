@@ -15,7 +15,7 @@ relay-proto = { path = "crates/relay-proto" }
 relay-net = { path = "crates/relay-net" }
 relay-capture = { path = "crates/relay-capture" }
 relay-codec = { path = "crates/relay-codec" }
-relay-crypto = { path = "crates/relay-crypto" }
+relay-crypto = { path = "crates/relay-crypto", default-features = false }
 relay-session = { path = "crates/relay-session" }
 
 prost = "0.14"
@@ -29,7 +29,7 @@ bytes = "1.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

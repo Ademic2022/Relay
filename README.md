@@ -13,54 +13,70 @@ Built milestone by milestone (PRD §12).
 | M0 Skeleton: workspace, traits, protobuf, CI | done |
 | M1 LAN screen view | macOS host + viewer working; Windows capture (DXGI) + encoder (Media Foundation) written, never run; acceptance not yet run on two machines |
 | M2 Remote control | mouse, keyboard (HID scancodes), scroll, ⌘/Ctrl mapping, HiDPI mapping, cursor channel written; not yet tried by hand |
-| M3–M8 | not started |
+| M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
+| M4–M8 | not started |
 
 ## Layout
 
 | Crate | Contents |
 |---|---|
 | `relay-proto` | protobuf wire protocol (`proto/relay.proto`), length-delimited codec with size cap |
-| `relay-crypto` | Ed25519 device keys, 9-digit Device IDs, key pinning, one-time / permanent passwords, keystore trait, PAKE interface |
-| `relay-net` | QUIC endpoints (quinn, BBR, small datagram buffer), channel map, video datagram framing, newest-wins reassembly |
+| `relay-crypto` | Ed25519 device keys, 9-digit Device IDs, OS keystore, one-time / permanent passwords, OPAQUE |
+| `relay-net` | QUIC endpoints with device-key mutual TLS, shared UDP socket for punch/relay control packets, channel map, video framing |
 | `relay-capture` | `ScreenCapturer` trait; ScreenCaptureKit (macOS); DXGI Desktop Duplication + GPU NV12 conversion (Windows); test pattern |
 | `relay-codec` | `Encoder` / `Decoder` traits; VideoToolbox (macOS) and Media Foundation (Windows) hardware encoders; openh264 software encoder/decoder |
 | `relay-input` | input model (USB HID usages + macOS/Windows key tables), ⌘/Ctrl mapping, HiDPI mapping; CGEvent (macOS) and SendInput (Windows) injectors |
 | `relay-session` | newest-wins channel, ABR controller, IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
 | `relay-render` | viewer present-mode policy (wgpu viewer in M1) |
 | `relay-service` | unattended-access agent targets (service in M7) |
-| `relay-server` | rendezvous + relay binary (networking in M3) |
+| `relay-server` | rendezvous (Device IDs, lookup, punch coordination) + blind UDP relay; Dockerfile |
 | `relay-app` | `relay` binary: M1 host (capture → encode → QUIC datagrams) and wgpu viewer |
 | `tools/latency-bench` | latency percentiles and release regression gate |
 
-## Try it (M1)
+## Try it
+
+**1. Run a server** (rendezvous + relay) somewhere both machines can reach:
 
 ```sh
-cargo build --release -p relay-app
-
-# On the machine to share (needs Screen Recording permission for your terminal):
-./target/release/relay host
-# prints: relay view <ip>:21118 --code <code>
-
-# On the viewing machine:
-./target/release/relay view <ip> --code <code>
+cargo run --release -p relay-server        # or: docker compose up -d
+# prints: --server-key <64 hex chars>   (clients pin this key)
 ```
 
-The viewer forwards mouse, keyboard and scroll to the host (`relay host --view-only` disables
-that). On macOS the host needs Accessibility permission for remote control; it asks once.
-`Ctrl+Alt+Enter` toggles full screen in the viewer. `--no-cmd-ctrl-swap` keeps ⌘ and Ctrl as-is
-between Mac and Windows; `--translate-chars` sends typed characters for mismatched layouts.
-OS-reserved shortcuts (⌘Tab, Ctrl+Alt+Del) are not captured yet.
+Open UDP 21116 and 21117 on the server's firewall.
 
-Windows works the same way (`target\release\relay.exe`). Allow `relay.exe` through Windows
-Firewall for UDP 21118.
+**2. On the machine to share:**
 
-Without Screen Recording permission, `relay host --test-pattern 1920x1080` streams a synthetic
-pattern. `relay view ... --measure` reads the pattern's timestamp stripe and logs latency
-percentiles (clocks must be NTP-synced across machines). In the viewer, `f` toggles full screen
-and `Esc` exits.
+```sh
+export RELAY_SERVER=<server-ip> RELAY_SERVER_KEY=<key>
+./target/release/relay host
+# prints: Your ID 123 456 789, Password ab3dEf7h
+```
 
-M1 direct mode accepts any host certificate and gates access with the session code only.
-Use it on trusted networks. Device-key pinning and OPAQUE arrive in M3.
+The host needs Screen Recording permission (macOS) to share the screen and Accessibility
+permission to be controlled. `--test-pattern 1920x1080` streams a synthetic image instead.
+
+**3. On the viewing machine:**
+
+```sh
+export RELAY_SERVER=<server-ip> RELAY_SERVER_KEY=<key>
+./target/release/relay connect "123 456 789"      # asks for the password
+```
+
+The host user gets an Accept / Decline prompt (auto-declines after 30 s). The connection is
+peer-to-peer when NAT allows, otherwise through the relay, which only forwards ciphertext.
+A relayed session keeps probing for a direct path and moves onto it without reconnecting.
+Without a server, `relay view <ip>` connects directly on the LAN (FR-7).
+
+Security model: device keys (Ed25519, OS keystore) authenticate both ends in TLS; the viewer
+pins each host's key and refuses a changed one (`relay forget <ID>` after a reinstall); the
+password is checked with OPAQUE, bound to the TLS session, so neither the server, the relay
+nor the network ever sees it. Five failed attempts lock a source out for 1 minute, doubling.
+
+Viewer keys: `Ctrl+Alt+Enter` full screen. `--no-cmd-ctrl-swap`, `--translate-chars`,
+`--measure` (latency, with `--test-pattern` on the host). OS-reserved shortcuts (⌘Tab,
+Ctrl+Alt+Del) are not captured yet. `RELAY_KEYSTORE=memory` uses a throwaway device key.
+
+On Windows, allow `relay.exe` through Windows Firewall.
 
 ## Build and test
 

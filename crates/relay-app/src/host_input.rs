@@ -147,13 +147,19 @@ mod tests {
 
     #[tokio::test]
     async fn events_arrive_in_order_and_release_on_disconnect() {
-        let (sep, _) = quic::server("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = sep.local_addr().unwrap();
+        let (hid, cid) = (crate::identity::ephemeral(), crate::identity::ephemeral());
+        let (sep, _) = quic::node(
+            "127.0.0.1:0".parse().unwrap(),
+            &hid.tls,
+            Some(&[quic::ALPN]),
+        )
+        .unwrap();
+        let addr = sep.endpoint.local_addr().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let released = Arc::new(Mutex::new(false));
         let (e2, r2) = (events.clone(), released.clone());
         let host = tokio::spawn(async move {
-            let conn = sep.accept().await.unwrap().await.unwrap();
+            let conn = sep.endpoint.accept().await.unwrap().await.unwrap();
             serve_with(conn, move || {
                 Some(Box::new(Recorder {
                     events: e2,
@@ -163,8 +169,15 @@ mod tests {
             .await;
         });
 
-        let (ep, _) = quic::client().unwrap();
-        let conn = quic::connect(&ep, addr).await.unwrap();
+        let (ep, _) = quic::node("127.0.0.1:0".parse().unwrap(), &cid.tls, None).unwrap();
+        let (cfg, _) = quic::client_config(
+            &cid.tls,
+            relay_net::tls::Expect::Key(hid.public_key()),
+            quic::ALPN,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let conn = quic::connect(&ep.endpoint, cfg, addr).await.unwrap();
         let mut s = conn.open_uni().await.unwrap();
         s.write_all(&[Channel::Input as u8]).await.unwrap();
         let sent = vec![

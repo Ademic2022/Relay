@@ -1,18 +1,30 @@
-//! `relay` — M1 command-line host and viewer.
+//! `relay` — command-line host and viewer.
 //!
 //! ```text
-//! relay host [--bind 0.0.0.0:21118] [--display ID] [--codec auto|hw|sw]
-//! relay view <host:port> --code <session code>
+//! relay host    [--server HOST --server-key KEY] [--display ID] [--view-only]
+//! relay connect <ID> --server HOST --server-key KEY
+//! relay view    <ip[:port]>                      (direct, no server: FR-7)
+//! relay forget  <ID | ip:port>                   (drop a pinned host key)
 //! ```
+//!
+//! `--server` / `--server-key` can also come from `RELAY_SERVER` and
+//! `RELAY_SERVER_KEY`.
 
 use std::net::SocketAddr;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::Context;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
+mod auth;
 mod clock;
+mod consent;
 mod host;
 mod host_input;
+mod identity;
 mod input_wire;
+mod migrate;
+mod pins;
+mod rdv;
 mod rt;
 mod viewer;
 
@@ -36,12 +48,58 @@ pub enum CodecChoice {
     Sw,
 }
 
+/// Rendezvous server settings (FR-41).
+#[derive(Debug, Clone, Args)]
+struct ServerArgs {
+    /// Rendezvous server, host[:port] (default port 21116).
+    #[arg(long, env = "RELAY_SERVER")]
+    server: Option<String>,
+    /// The server's public key, as printed by relay-server.
+    #[arg(long, env = "RELAY_SERVER_KEY")]
+    server_key: Option<String>,
+}
+
+impl ServerArgs {
+    fn resolve(&self) -> anyhow::Result<Option<rdv::Server>> {
+        match (&self.server, &self.server_key) {
+            (None, _) => Ok(None),
+            (Some(_), None) => {
+                anyhow::bail!("--server needs --server-key (printed by relay-server)")
+            }
+            (Some(s), Some(k)) => Ok(Some(rdv::Server {
+                addr: rdv::parse_server(s)?,
+                key: relay_net::parse_hex32(k).context("--server-key must be 64 hex characters")?,
+            })),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct ViewerArgs {
+    /// Password shown by the host (prompted for if omitted).
+    #[arg(long, alias = "code")]
+    password: Option<String>,
+    /// Measure glass-to-glass latency from the host's --test-pattern
+    /// timestamp stripe (clocks must be synced across machines).
+    #[arg(long)]
+    measure: bool,
+    /// Do not swap ⌘ and Ctrl between macOS and Windows (FR-15).
+    #[arg(long)]
+    no_cmd_ctrl_swap: bool,
+    /// Send typed characters instead of physical keys, for mismatched
+    /// keyboard layouts (FR-14).
+    #[arg(long)]
+    translate_chars: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Share this machine's screen.
     Host {
         #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], DIRECT_PORT)))]
         bind: SocketAddr,
+        #[command(flatten)]
+        server: ServerArgs,
         /// Display ID to share (default: primary). See --list-displays.
         #[arg(long)]
         display: Option<u32>,
@@ -62,24 +120,29 @@ enum Cmd {
         #[arg(long)]
         view_only: bool,
     },
-    /// View a host's screen.
+    /// Connect to a host by its 9-digit ID.
+    Connect {
+        /// Device ID, e.g. "123 456 789".
+        id: String,
+        #[command(flatten)]
+        server: ServerArgs,
+        #[command(flatten)]
+        viewer: ViewerArgs,
+        /// Skip peer-to-peer and go through the relay (testing).
+        #[arg(long)]
+        force_relay: bool,
+    },
+    /// Connect directly to a host's IP address (no server; FR-7).
     View {
-        /// Host address, e.g. 192.168.1.20:21118 (port defaults to 21118).
+        /// Host address, e.g. 192.168.1.20 (port defaults to 21118).
         addr: String,
-        /// Session code shown by the host.
-        #[arg(long)]
-        code: String,
-        /// Measure glass-to-glass latency from the host's --test-pattern
-        /// timestamp stripe (clocks must be synced across machines).
-        #[arg(long)]
-        measure: bool,
-        /// Do not swap ⌘ and Ctrl between macOS and Windows (FR-15).
-        #[arg(long)]
-        no_cmd_ctrl_swap: bool,
-        /// Send typed characters instead of physical keys, for mismatched
-        /// keyboard layouts (FR-14).
-        #[arg(long)]
-        translate_chars: bool,
+        #[command(flatten)]
+        viewer: ViewerArgs,
+    },
+    /// Forget a host's pinned device key (after a reinstall).
+    Forget {
+        /// Device ID or ip:port, as shown in the warning.
+        name: String,
     },
 }
 
@@ -96,6 +159,7 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Host {
             bind,
+            server,
             display,
             list_displays,
             test_pattern,
@@ -104,8 +168,9 @@ fn main() -> anyhow::Result<()> {
             fps,
             view_only,
         } => host::run(host::Options {
-            view_only,
             bind,
+            server: server.resolve()?,
+            view_only,
             display,
             list_displays,
             test_pattern: test_pattern.map(|s| parse_size(&s)).transpose()?,
@@ -113,23 +178,43 @@ fn main() -> anyhow::Result<()> {
             bitrate_kbps: bitrate,
             fps,
         }),
-        Cmd::View {
-            addr,
-            code,
-            measure,
-            no_cmd_ctrl_swap,
-            translate_chars,
+        Cmd::Connect {
+            id,
+            server,
+            viewer,
+            force_relay,
         } => {
-            let addr = parse_addr(&addr)?;
-            viewer::run(viewer::ViewOptions {
-                addr,
-                code,
-                measure,
-                cmd_ctrl_swap: !no_cmd_ctrl_swap,
-                translate_chars,
-            })
+            let id = relay_crypto::DeviceId::parse(&id).context("a Device ID has 9 digits")?;
+            let server = server
+                .resolve()?
+                .context("connecting by ID needs --server and --server-key (or RELAY_SERVER / RELAY_SERVER_KEY)")?;
+            run_viewer(viewer::Target::Id { id, server }, viewer, force_relay)
+        }
+        Cmd::View { addr, viewer } => {
+            run_viewer(viewer::Target::Direct(parse_addr(&addr)?), viewer, false)
+        }
+        Cmd::Forget { name } => {
+            let name: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+            pins::forget(&name);
+            println!("Forgot the pinned key for {name}.");
+            Ok(())
         }
     }
+}
+
+fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyhow::Result<()> {
+    let password = match v.password {
+        Some(p) => p,
+        None => rpassword::prompt_password(format!("Password for {target}: "))?,
+    };
+    viewer::run(viewer::ViewOptions {
+        target,
+        password: password.trim().to_string(),
+        force_relay,
+        measure: v.measure,
+        cmd_ctrl_swap: !v.no_cmd_ctrl_swap,
+        translate_chars: v.translate_chars,
+    })
 }
 
 fn parse_size(s: &str) -> anyhow::Result<(u32, u32)> {
