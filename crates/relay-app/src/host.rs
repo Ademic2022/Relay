@@ -34,6 +34,8 @@ pub struct Options {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub view_only: bool,
+    /// Sync clipboard text with the Controller (FR-17).
+    pub clipboard: bool,
     pub server: Option<crate::rdv::Server>,
 }
 
@@ -84,7 +86,7 @@ pub fn run(opts: Options) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(opts, display))
+    rt.block_on(serve(opts, display, displays))
 }
 
 /// Per-session credentials. The one-time password rotates after every
@@ -114,6 +116,8 @@ struct HostState {
     hub: crate::rdv::ControlHub,
     opts: Options,
     display: relay_capture::DisplayInfo,
+    /// Every display, for the monitor picker (FR-20).
+    displays: Vec<relay_capture::DisplayInfo>,
     me: Arc<crate::identity::Me>,
     creds: Mutex<Arc<Credentials>>,
     limiters: Mutex<Limiters>,
@@ -134,7 +138,11 @@ impl HostState {
     }
 }
 
-async fn serve(opts: Options, display: relay_capture::DisplayInfo) -> anyhow::Result<()> {
+async fn serve(
+    opts: Options,
+    display: relay_capture::DisplayInfo,
+    displays: Vec<relay_capture::DisplayInfo>,
+) -> anyhow::Result<()> {
     let me = Arc::new(crate::identity::load()?);
     let (node, control) = quic::node(opts.bind, &me.tls, Some(&[quic::ALPN]))?;
     let node = Arc::new(node);
@@ -186,6 +194,7 @@ async fn serve(opts: Options, display: relay_capture::DisplayInfo) -> anyhow::Re
         hub: hub.clone(),
         opts: opts.clone(),
         display: display.clone(),
+        displays,
         me: me.clone(),
         creds: Mutex::new(Arc::new(creds)),
         limiters: Mutex::new(limiters),
@@ -380,7 +389,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         &control(Msg::Permissions(v1::Permissions {
             view: true,
             control: !opts.view_only,
-            clipboard: false,
+            clipboard: opts.clipboard && !opts.view_only,
             file_transfer: false,
         })),
     )
@@ -407,30 +416,48 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             }
         })
     };
+    // Input follows the selected display (FR-21).
+    let (target_tx, target_rx) = tokio::sync::watch::channel(target_of(display));
     let input_task = tokio::spawn(crate::host_input::serve(
         conn.clone(),
-        relay_input::DisplayTarget {
-            id: display.id,
-            x: display.x,
-            y: display.y,
-            width: display.width,
-            height: display.height,
-        },
+        target_rx,
         !opts.view_only,
+        opts.clipboard && !opts.view_only,
+        if peer.name.is_empty() {
+            "viewer".into()
+        } else {
+            peer.name.clone()
+        },
     ));
+    // Chat (FR-24): lines typed in this terminal go to the viewer.
+    let chat = crate::chat::ChatLink::start(conn);
+    println!("  Type a message and press Enter to chat with the viewer.");
+    let chat_task = {
+        let mut lines = crate::stdin::lines();
+        tokio::spawn(async move {
+            while let Ok(l) = lines.recv().await {
+                let sent = chat.send(&l);
+                if !sent.is_empty() {
+                    println!(
+                        "  💬 you {}: {sent}",
+                        crate::chat::clock(crate::chat::now_ms())
+                    );
+                }
+            }
+        })
+    };
+    // FR-20: every display, with resolution, scale and arrangement.
     quic::send_msg(
         &mut tx,
         &control(Msg::Monitors(v1::MonitorList {
-            displays: vec![v1::Display {
-                id: display.id,
-                name: display.name.clone(),
-                x: display.x,
-                y: display.y,
-                width: display.width,
-                height: display.height,
-                scale: display.scale,
-                primary: display.primary,
-            }],
+            displays: st.displays.iter().map(proto_display).collect(),
+        })),
+    )
+    .await?;
+    quic::send_msg(
+        &mut tx,
+        &control(Msg::SelectMonitor(v1::SelectMonitor {
+            display_id: display.id,
         })),
     )
     .await?;
@@ -451,6 +478,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         opts.bitrate_kbps,
         opts.fps,
     ));
+    shared.display_id.store(display.id, Ordering::Relaxed);
     let pipeline = {
         let shared = shared.clone();
         let conn = conn.clone();
@@ -494,6 +522,15 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::AbrFeedback(fb)) })) => {
                     control_state.on_feedback(&fb, &shared);
                 }
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::SelectMonitor(sel)) })) => {
+                    // FR-21: switch the captured display; only it is encoded.
+                    if let Some(d) = st.displays.iter().find(|d| d.id == sel.display_id) {
+                        shared.display_id.store(d.id, Ordering::Relaxed);
+                        let _ = target_tx.send(target_of(d));
+                        println!("  Sharing display {} ({}x{}).", d.id, d.width, d.height);
+                        let _ = quic::send_msg(&mut tx, &control(Msg::SelectMonitor(v1::SelectMonitor { display_id: d.id }))).await;
+                    }
+                }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::SetQuality(q)) })) => {
                     let mode = v1::QualityMode::try_from(q.mode).unwrap_or(v1::QualityMode::Speed);
                     control_state.set_mode(mode, &shared);
@@ -524,6 +561,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     }
     drop(prober);
     input_task.abort();
+    chat_task.abort();
     drop(cursor_tx);
     cursor_task.abort();
     let _ = tokio::task::spawn_blocking(move || pipeline.join()).await;
@@ -538,6 +576,29 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         started.elapsed().as_secs()
     ));
     Ok(SessionOutcome::Ended { quit })
+}
+
+fn target_of(d: &relay_capture::DisplayInfo) -> relay_input::DisplayTarget {
+    relay_input::DisplayTarget {
+        id: d.id,
+        x: d.x,
+        y: d.y,
+        width: d.width,
+        height: d.height,
+    }
+}
+
+fn proto_display(d: &relay_capture::DisplayInfo) -> v1::Display {
+    v1::Display {
+        id: d.id,
+        name: d.name.clone(),
+        x: d.x,
+        y: d.y,
+        width: d.width,
+        height: d.height,
+        scale: d.scale,
+        primary: d.primary,
+    }
 }
 
 fn hostname() -> String {

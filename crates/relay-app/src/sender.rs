@@ -30,6 +30,8 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 pub struct SenderControl {
     pub stop: AtomicBool,
     pub force_key: AtomicBool,
+    /// Display to capture (FR-21); 0 = the one `run` was started with.
+    pub display_id: AtomicU32,
     pub bitrate_kbps: AtomicU32,
     pub fps: AtomicU32,
     /// Resolution scale × 1000 (1000 = native).
@@ -44,6 +46,7 @@ impl SenderControl {
         Self {
             stop: AtomicBool::new(false),
             force_key: AtomicBool::new(true),
+            display_id: AtomicU32::new(0),
             bitrate_kbps: AtomicU32::new(bitrate_kbps),
             fps: AtomicU32::new(fps),
             scale_milli: AtomicU32::new(1000),
@@ -171,14 +174,16 @@ pub fn run(
     ctl: &SenderControl,
     cursor_tx: Option<&tokio::sync::mpsc::UnboundedSender<v1::CursorMessage>>,
 ) -> anyhow::Result<()> {
+    let native_of = |cap: &dyn ScreenCapturer, id: u32| -> anyhow::Result<(u32, u32)> {
+        cap.displays()?
+            .into_iter()
+            .find(|d| d.id == id)
+            .map(|d| (d.width & !1, d.height & !1))
+            .context("display vanished")
+    };
     cap.select(display_id)?;
-    let native = cap
-        .displays()?
-        .into_iter()
-        .find(|d| d.id == display_id)
-        .map(|d| (d.width & !1, d.height & !1))
-        .context("display vanished")?;
-    let mut size = native;
+    let mut current = display_id;
+    let mut size = native_of(cap.as_ref(), display_id)?;
     let mut scale_milli = 1000;
     let new_encoder = |(w, h): (u32, u32), kbps: u32| {
         make_encoder(
@@ -197,6 +202,23 @@ pub fn run(
     let mut cursor = CursorSync::default();
 
     while !ctl.stop.load(Ordering::Relaxed) {
+        // Monitor switch (FR-21): capture and encode only the new display.
+        let want = ctl.display_id.load(Ordering::Relaxed);
+        if want != 0 && want != current {
+            cap.select(want)?;
+            current = want;
+            size = native_of(cap.as_ref(), want)?;
+            if scale_milli != 1000
+                && let Ok(s) = cap.set_scale(scale_milli as f32 / 1000.0)
+            {
+                size = s;
+            }
+            enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed))?;
+            last = None;
+            ctl.force_key.store(true, Ordering::Relaxed);
+            tracing::info!("now capturing display {want} at {}x{}", size.0, size.1);
+            continue;
+        }
         let frame = {
             let _s = tracing::trace_span!("capture_wait").entered();
             // Short wait so pointer-only changes are picked up promptly.

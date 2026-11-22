@@ -28,6 +28,8 @@ const FPS: u32 = 30;
 struct Outcome {
     /// (decode instant, glass-to-decode latency)
     decoded: Vec<(Instant, Duration)>,
+    /// Decoded frame sizes, in order.
+    sizes: Vec<(u32, u32)>,
     recovered: u64,
     final_kbps: u32,
     final_fps: u32,
@@ -66,6 +68,17 @@ impl Outcome {
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
+    run_with(up, down, start_kbps, secs, None).await
+}
+
+/// `switch`: after this long, capture display 2 instead (multi-monitor).
+async fn run_with(
+    up: Link,
+    down: Link,
+    start_kbps: u32,
+    secs: u64,
+    switch: Option<Duration>,
+) -> Outcome {
     let _serial = SERIAL.lock().await;
     let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (host_id, ctl_id) = (crate::identity::ephemeral(), crate::identity::ephemeral());
@@ -82,7 +95,8 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
         let sender = {
             let (conn, sc) = (conn.clone(), sc.clone());
             std::thread::spawn(move || {
-                let mut cap = relay_capture::pattern::PatternCapturer::new(W, H, FPS);
+                let mut cap =
+                    relay_capture::pattern::PatternCapturer::new(W, H, FPS).with_display(480, 270);
                 cap.noise = true;
                 let params = SenderParams {
                     codec: CodecChoice::Sw,
@@ -138,6 +152,7 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
     let decoder = std::thread::spawn(move || {
         let mut dec = relay_codec::openh264::OpenH264Decoder::new().unwrap();
         let mut out = Vec::new();
+        let mut sizes = Vec::new();
         let mut need_key = false;
         while let Ok(f) = dec_rx.recv() {
             if need_key && !f.is_key {
@@ -151,11 +166,12 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
                 }
             }
             match relay_codec::Decoder::decode(&mut dec, &f.data, f.capture_ts_us) {
-                Ok(Some(_)) => {
+                Ok(Some(d)) => {
                     need_key = false;
                     let lat =
                         Duration::from_micros(clock::now_us().saturating_sub(f.capture_ts_us));
                     out.push((Instant::now(), lat));
+                    sizes.push((d.width, d.height));
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -164,7 +180,7 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
                 }
             }
         }
-        out
+        (out, sizes)
     });
 
     let started = Instant::now();
@@ -172,7 +188,14 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
     let mut fb = crate::feedback::Feedback::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let switch_at = switch.map(|d| tokio::time::Instant::now() + d);
     loop {
+        if let Some(at) = switch_at
+            && tokio::time::Instant::now() >= at
+            && ctl_shared.display_id.load(Ordering::Relaxed) != 2
+        {
+            ctl_shared.display_id.store(2, Ordering::Relaxed);
+        }
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
             dg = conn.read_datagram() => {
@@ -197,12 +220,13 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
     }
     let recovered = reasm.stats().frames_recovered;
     drop(dec_tx);
-    let decoded = decoder.join().unwrap();
+    let (decoded, sizes) = decoder.join().unwrap();
     let _ = tx.finish();
     conn.close(0u32.into(), b"done");
     let _ = tokio::time::timeout(Duration::from_secs(3), host_task).await;
     Outcome {
         decoded,
+        sizes,
         recovered,
         final_kbps: ctl_shared.bitrate_kbps.load(Ordering::Relaxed),
         final_fps: ctl_shared.fps.load(Ordering::Relaxed),
@@ -297,4 +321,33 @@ async fn one_mbit_bottleneck_downscales_gracefully() {
         "latency p95 {:?}",
         o.latency_p95(settled)
     );
+}
+
+/// FR-21: switching monitors re-targets capture and encode mid-session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitor_switch_changes_the_stream() {
+    let o = run_with(
+        Link::default(),
+        Link::default(),
+        3_000,
+        4,
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+    let first = o.sizes.first().copied();
+    let last = o.sizes.last().copied();
+    eprintln!(
+        "[monitor switch] {:?} → {:?}, {} frames",
+        first,
+        last,
+        o.sizes.len()
+    );
+    assert_eq!(first, Some((W, H)), "starts on display 1");
+    assert_eq!(last, Some((480, 270)), "ends on display 2");
+    let after: Vec<_> = o.sizes.iter().skip_while(|s| **s == (W, H)).collect();
+    assert!(
+        after.iter().all(|s| **s == (480, 270)),
+        "no frames from display 1 after the switch"
+    );
+    assert!(after.len() > 20, "display 2 keeps streaming");
 }

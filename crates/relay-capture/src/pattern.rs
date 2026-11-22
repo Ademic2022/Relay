@@ -17,6 +17,8 @@ pub const STRIPE_BLOCKS: usize = 32;
 #[derive(Debug)]
 pub struct PatternCapturer {
     native: (u32, u32),
+    /// Size of display 1.
+    first: (u32, u32),
     width: u32,
     height: u32,
     fps: u32,
@@ -25,6 +27,9 @@ pub struct PatternCapturer {
     /// Fill part of each frame with fresh noise: incompressible content
     /// that makes the encoder hit its bitrate target (network tests).
     pub noise: bool,
+    /// Extra virtual displays (id 2, 3, ...) for multi-monitor tests.
+    extra: Vec<(u32, u32)>,
+    selected: u32,
 }
 
 /// Wall-clock Unix time in ms, low 32 bits (wraps every ~49 days).
@@ -38,12 +43,15 @@ impl PatternCapturer {
     pub fn new(width: u32, height: u32, fps: u32) -> Self {
         Self {
             native: (width & !1, height & !1),
+            first: (width & !1, height & !1),
             width: width & !1,
             height: height & !1,
             fps: fps.max(1),
             next: Instant::now(),
             n: 0,
             noise: false,
+            extra: Vec::new(),
+            selected: 1,
         }
     }
 }
@@ -211,6 +219,19 @@ fn mem_frame_with(w: usize, h: usize, n: u64, ms: u32, noise: bool) -> Arc<dyn N
 }
 
 impl PatternCapturer {
+    /// Add a virtual display (ids 2, 3, … in order).
+    pub fn with_display(mut self, width: u32, height: u32) -> Self {
+        self.extra.push((width & !1, height & !1));
+        self
+    }
+
+    fn size_of(&self, id: u32) -> Option<(u32, u32)> {
+        match id {
+            1 => Some(self.first),
+            n => self.extra.get(n as usize - 2).copied(),
+        }
+    }
+
     /// Frames in system memory on every OS (for the software encoder in
     /// tests), instead of IOSurfaces on macOS.
     pub fn cpu_frames(self) -> CpuPattern {
@@ -292,22 +313,33 @@ impl ScreenCapturer for PatternCapturer {
     }
 
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
-        Ok(vec![DisplayInfo {
-            id: 1,
-            name: "Test pattern".into(),
-            x: 0,
-            y: 0,
-            width: self.native.0,
-            height: self.native.1,
-            scale: 1.0,
-            primary: true,
-        }])
+        let mut x = 0;
+        Ok((1..=1 + self.extra.len() as u32)
+            .map(|id| {
+                let (w, h) = self.size_of(id).expect("listed");
+                let d = DisplayInfo {
+                    id,
+                    name: format!("Test pattern {id}"),
+                    x,
+                    y: 0,
+                    width: w,
+                    height: h,
+                    scale: 1.0,
+                    primary: id == 1,
+                };
+                x += w as i32;
+                d
+            })
+            .collect())
     }
 
     fn select(&mut self, display_id: u32) -> Result<(), CaptureError> {
-        if display_id != 1 {
-            return Err(CaptureError::NoSuchDisplay(display_id));
-        }
+        let size = self
+            .size_of(display_id)
+            .ok_or(CaptureError::NoSuchDisplay(display_id))?;
+        self.selected = display_id;
+        self.native = size;
+        (self.width, self.height) = size;
         Ok(())
     }
 

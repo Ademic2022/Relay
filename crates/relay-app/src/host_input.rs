@@ -20,8 +20,22 @@ enum Msg {
 
 /// Accept the Controller's streams for this session and route input to an
 /// injector thread. Returns when the connection closes.
-pub async fn serve(conn: Connection, target: DisplayTarget, control_allowed: bool) {
-    serve_with(conn, move || platform(target, control_allowed)).await;
+pub async fn serve(
+    conn: Connection,
+    targets: tokio::sync::watch::Receiver<DisplayTarget>,
+    control_allowed: bool,
+    clipboard_allowed: bool,
+    peer_name: String,
+) {
+    let initial = *targets.borrow();
+    serve_streams(
+        conn,
+        move || platform(initial, control_allowed),
+        Some(targets),
+        clipboard_allowed,
+        peer_name,
+    )
+    .await;
 }
 
 /// Injector selection for the real host.
@@ -53,19 +67,39 @@ fn platform(target: DisplayTarget, control_allowed: bool) -> Option<Box<dyn Inpu
     }
 }
 
-pub async fn serve_with<F>(conn: Connection, make_injector: F)
-where
+#[cfg(test)]
+pub async fn serve_with<F>(
+    conn: Connection,
+    make_injector: F,
+    targets: Option<tokio::sync::watch::Receiver<DisplayTarget>>,
+) where
+    F: FnOnce() -> Option<Box<dyn InputInjector>> + Send + 'static,
+{
+    serve_streams(conn, make_injector, targets, false, String::new()).await;
+}
+
+/// Route the Controller's streams: input to the injector thread,
+/// clipboard to a [`crate::clipboard::ClipboardSync`] (started only when
+/// the Controller opens its clipboard stream, FR-17).
+async fn serve_streams<F>(
+    conn: Connection,
+    make_injector: F,
+    targets: Option<tokio::sync::watch::Receiver<DisplayTarget>>,
+    clipboard_allowed: bool,
+    peer_name: String,
+) where
     F: FnOnce() -> Option<Box<dyn InputInjector>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Msg>();
     let injector = std::thread::Builder::new()
         .name("relay-input".into())
-        .spawn(move || inject_loop(rx, make_injector()));
+        .spawn(move || inject_loop(rx, make_injector(), targets));
     if let Err(e) = injector {
         tracing::error!("input thread: {e}");
         return;
     }
 
+    let mut clipboard: Option<crate::clipboard::ClipboardSync> = None;
     while let Ok(mut rx) = conn.accept_uni().await {
         let mut tag = [0u8; 1];
         if rx.read_exact(&mut tag).await.is_err() {
@@ -87,17 +121,49 @@ where
                     }
                 });
             }
+            Some(Channel::Clipboard) if clipboard_allowed => {
+                if clipboard.is_none()
+                    && let Some(board) = crate::clipboard::os_board()
+                {
+                    clipboard = Some(crate::clipboard::ClipboardSync::start(&conn, board));
+                }
+                if let Some(c) = &clipboard {
+                    c.receive(rx);
+                }
+            }
+            Some(Channel::Chat) => {
+                // FR-24, host side: the terminal until the Tauri UI.
+                let who = peer_name.clone();
+                crate::chat::receive(rx, move |m| {
+                    println!(
+                        "  💬 {who} {}: {}",
+                        crate::chat::clock(m.sent_at_ms),
+                        m.text
+                    );
+                    true
+                });
+            }
             other => tracing::debug!("ignoring stream {other:?}"),
         }
     }
     // Dropping `tx` ends the injector, which releases held keys/buttons.
 }
 
-fn inject_loop(rx: mpsc::Receiver<Msg>, mut inj: Option<Box<dyn InputInjector>>) {
+fn inject_loop(
+    rx: mpsc::Receiver<Msg>,
+    mut inj: Option<Box<dyn InputInjector>>,
+    mut targets: Option<tokio::sync::watch::Receiver<DisplayTarget>>,
+) {
     crate::rt::set_realtime();
     let mut stats = (0u32, Duration::ZERO, Duration::ZERO, Instant::now());
     while let Ok(Msg::Event(ev, received)) = rx.recv() {
         let Some(i) = inj.as_mut() else { continue };
+        // The Controller switched monitors: map pointer moves onto it.
+        if let Some(t) = targets.as_mut()
+            && t.has_changed().unwrap_or(false)
+        {
+            i.set_display(*t.borrow_and_update());
+        }
         let _s = tracing::trace_span!("inject").entered();
         if let Err(e) = i.inject(&ev) {
             tracing::debug!("inject {ev:?}: {e}");
@@ -160,12 +226,16 @@ mod tests {
         let (e2, r2) = (events.clone(), released.clone());
         let host = tokio::spawn(async move {
             let conn = sep.endpoint.accept().await.unwrap().await.unwrap();
-            serve_with(conn, move || {
-                Some(Box::new(Recorder {
-                    events: e2,
-                    released: r2,
-                }) as Box<dyn InputInjector>)
-            })
+            serve_with(
+                conn,
+                move || {
+                    Some(Box::new(Recorder {
+                        events: e2,
+                        released: r2,
+                    }) as Box<dyn InputInjector>)
+                },
+                None,
+            )
             .await;
         });
 

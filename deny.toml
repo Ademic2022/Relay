@@ -26,6 +26,9 @@ allow = [
   "Unicode-3.0",
   "Zlib",
   "CC0-1.0",
+  # Boost Software License 1.0: permissive, OSI-approved (clipboard-win via
+  # arboard). Not to be confused with the Business Source License.
+  "BSL-1.0",
 ]
 
 [bans]

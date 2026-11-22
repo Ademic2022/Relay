@@ -16,6 +16,8 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod auth;
+mod chat;
+mod clipboard;
 mod clock;
 mod consent;
 mod feedback;
@@ -30,6 +32,7 @@ mod pins;
 mod rdv;
 mod rt;
 mod sender;
+mod stdin;
 mod viewer;
 
 /// Default port for direct (no-rendezvous) connections.
@@ -94,6 +97,9 @@ struct ViewerArgs {
     /// keyboard layouts (FR-14).
     #[arg(long)]
     translate_chars: bool,
+    /// Do not sync the clipboard with the host (FR-17).
+    #[arg(long)]
+    no_clipboard: bool,
     /// Starting quality mode; Ctrl+Alt+Q cycles it in the viewer.
     #[arg(long, value_enum, default_value_t = Quality::Speed)]
     quality: Quality,
@@ -136,6 +142,9 @@ enum Cmd {
         /// Let viewers watch but not control (FR-11).
         #[arg(long)]
         view_only: bool,
+        /// Do not sync the clipboard with the viewer (FR-17).
+        #[arg(long)]
+        no_clipboard: bool,
     },
     /// Connect to a host by its 9-digit ID.
     Connect {
@@ -184,7 +193,9 @@ fn main() -> anyhow::Result<()> {
             bitrate,
             fps,
             view_only,
+            no_clipboard,
         } => host::run(host::Options {
+            clipboard: !no_clipboard,
             bind,
             server: server.resolve()?,
             view_only,
@@ -231,6 +242,7 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
         measure: v.measure,
         cmd_ctrl_swap: !v.no_cmd_ctrl_swap,
         translate_chars: v.translate_chars,
+        clipboard: !v.no_clipboard,
         quality: match v.quality {
             Quality::Speed => relay_proto::v1::QualityMode::Speed,
             Quality::Balanced => relay_proto::v1::QualityMode::Balanced,

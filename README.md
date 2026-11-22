@@ -15,7 +15,8 @@ Built milestone by milestone (PRD §12).
 | M2 Remote control | mouse, keyboard (HID scancodes), scroll, ⌘/Ctrl mapping, HiDPI mapping, cursor channel written; not yet tried by hand |
 | M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
 | M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
-| M5–M8 | not started |
+| M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
+| M6–M8 | not started |
 
 ## Layout
 
@@ -73,8 +74,19 @@ pins each host's key and refuses a changed one (`relay forget <ID>` after a rein
 password is checked with OPAQUE, bound to the TLS session, so neither the server, the relay
 nor the network ever sees it. Five failed attempts lock a source out for 1 minute, doubling.
 
-Viewer keys: `Ctrl+Alt+Enter` full screen, `Ctrl+Alt+S` stats overlay, `Ctrl+Alt+Q` cycles the
-quality mode (Speed / Balanced / Quality; `--quality` sets the start). `--no-cmd-ctrl-swap`, `--translate-chars`,
+Viewer keys (never sent to the host):
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Alt+Enter` | full screen |
+| `Ctrl+Alt+S` | stats overlay |
+| `Ctrl+Alt+Q` | cycle quality mode (Speed / Balanced / Quality; `--quality` sets the start) |
+| `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor |
+| `Ctrl+Alt+C` | chat panel (typing goes to the chat while open; Enter sends, Esc closes) |
+
+On the host, chat messages appear in the terminal; type a line and press Enter to reply.
+Clipboard text syncs both ways (copies made after connecting only); `--no-clipboard` on
+either side turns it off. `--no-cmd-ctrl-swap`, `--translate-chars`,
 `--measure` (latency, with `--test-pattern` on the host). OS-reserved shortcuts (⌘Tab,
 Ctrl+Alt+Del) are not captured yet. `RELAY_KEYSTORE=memory` uses a throwaway device key.
 

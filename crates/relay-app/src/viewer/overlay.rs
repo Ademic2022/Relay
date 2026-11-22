@@ -35,6 +35,8 @@ pub struct Overlay {
     uniform: wgpu::Buffer,
     tex: Option<(wgpu::Texture, wgpu::BindGroup, u32, u32)>,
     pub visible: bool,
+    /// Anchor at the bottom-left instead of the top-left.
+    pub bottom: bool,
 }
 
 /// Rasterise `lines` (ASCII) at integer `scale`: white text on a
@@ -158,6 +160,7 @@ impl Overlay {
             uniform,
             tex: None,
             visible: false,
+            bottom: false,
         }
     }
 
@@ -237,7 +240,11 @@ impl Overlay {
             return;
         }
         let x0 = -1.0 + 2.0 * MARGIN / vw;
-        let y0 = 1.0 - 2.0 * MARGIN / vh;
+        let y0 = if self.bottom {
+            -1.0 + 2.0 * (MARGIN + *h as f32) / vh
+        } else {
+            1.0 - 2.0 * MARGIN / vh
+        };
         let rect = [x0, y0, x0 + 2.0 * *w as f32 / vw, y0 - 2.0 * *h as f32 / vh];
         let bytes: Vec<u8> = rect.iter().flat_map(|f| f.to_le_bytes()).collect();
         queue.write_buffer(&self.uniform, 0, &bytes);

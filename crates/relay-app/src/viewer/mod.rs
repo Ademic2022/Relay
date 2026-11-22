@@ -35,6 +35,7 @@ const DECODE_QUEUE: usize = 6;
 #[derive(Debug)]
 pub enum UserEvent {
     Frame,
+    Chat(v1::ChatMessage),
     Cursor(v1::CursorMessage),
     Status(String),
     Closed(String),
@@ -59,6 +60,9 @@ pub struct Shared {
     pub frames: latest::Receiver<DecodedFrame>,
     pub host_name: Mutex<String>,
     pub host: Mutex<HostInfo>,
+    /// Host displays (FR-20) and the one being shown.
+    pub displays: Mutex<Vec<v1::Display>>,
+    pub current_display: std::sync::atomic::AtomicU32,
 }
 
 /// What the host told us about itself during setup.
@@ -66,10 +70,13 @@ pub struct Shared {
 pub struct HostInfo {
     pub os: Option<relay_input::Os>,
     pub control: bool,
+    pub clipboard: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ViewOptions {
+    /// Sync clipboard text with the host (FR-17).
+    pub clipboard: bool,
     /// Initial quality mode (FR-19, §6 rule 10).
     pub quality: v1::QualityMode,
     pub target: Target,
@@ -94,6 +101,8 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
         frames: frame_rx,
         host_name: Mutex::new(target.to_string()),
         host: Mutex::new(HostInfo::default()),
+        displays: Mutex::new(Vec::new()),
+        current_display: std::sync::atomic::AtomicU32::new(0),
     });
     let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
     // Input from the window to the network. Unbounded: events are tiny and
@@ -101,6 +110,8 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
     let (input_tx, input_rx) = tmpsc::unbounded_channel::<v1::InputEvent>();
     // Control messages from the window (quality mode).
     let (ui_tx, ui_rx) = tmpsc::unbounded_channel::<v1::ControlMessage>();
+    // Chat lines typed in the window.
+    let (chat_tx, chat_rx) = tmpsc::unbounded_channel::<String>();
 
     let net = {
         let proxy = proxy.clone();
@@ -123,9 +134,12 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
                     frame_tx,
                     proxy.clone(),
                     shared,
-                    quit_rx,
-                    input_rx,
-                    ui_rx,
+                    FromWindow {
+                        quit: quit_rx,
+                        input_rx,
+                        ui_rx,
+                        chat_rx,
+                    },
                 ));
                 let msg = match res {
                     Ok(m) => m,
@@ -135,7 +149,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
             })?
     };
 
-    let mut app = render::App::new(shared, quit_tx, input_tx, ui_tx, &opts);
+    let mut app = render::App::new(shared, quit_tx, input_tx, ui_tx, chat_tx, &opts);
     event_loop.run_app(&mut app)?;
     let _ = net.join();
     if let Some(msg) = app.close_reason() {
@@ -249,20 +263,32 @@ fn control(msg: Msg) -> v1::ControlMessage {
     v1::ControlMessage { msg: Some(msg) }
 }
 
+/// What the window sends to the network side.
+struct FromWindow {
+    quit: tokio::sync::oneshot::Receiver<()>,
+    input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
+    ui_rx: tmpsc::UnboundedReceiver<v1::ControlMessage>,
+    chat_rx: tmpsc::UnboundedReceiver<String>,
+}
+
 async fn network(
     ViewOptions {
         target,
         password,
         force_relay,
         quality,
+        clipboard,
         ..
     }: ViewOptions,
     frames_out: latest::Sender<DecodedFrame>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
-    mut quit: tokio::sync::oneshot::Receiver<()>,
-    mut input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
-    mut ui_rx: tmpsc::UnboundedReceiver<v1::ControlMessage>,
+    FromWindow {
+        mut quit,
+        mut input_rx,
+        mut ui_rx,
+        mut chat_rx,
+    }: FromWindow,
 ) -> anyhow::Result<String> {
     let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {}…", target)));
     let me = crate::identity::load()?;
@@ -298,19 +324,23 @@ async fn network(
             Some(v1::ControlMessage {
                 msg: Some(Msg::Permissions(p)),
             }) => {
-                shared.host.lock().expect("poisoned").control = p.control;
+                {
+                    let mut h = shared.host.lock().expect("poisoned");
+                    h.control = p.control;
+                    h.clipboard = p.clipboard;
+                }
                 if !p.control {
                     tracing::info!("host allows viewing only");
                 }
             }
             Some(v1::ControlMessage {
                 msg: Some(Msg::Monitors(m)),
-            }) => {
-                if let Some(d) = m.displays.first() {
-                    let mut n = shared.host_name.lock().expect("poisoned");
-                    *n = format!("{n} · {}x{}", d.width, d.height);
-                }
-            }
+            }) => *shared.displays.lock().expect("poisoned") = m.displays,
+            Some(v1::ControlMessage {
+                msg: Some(Msg::SelectMonitor(sel)),
+            }) => shared
+                .current_display
+                .store(sel.display_id, std::sync::atomic::Ordering::Relaxed),
             Some(_) => {}
             None => bail!("host closed the control stream"),
         }
@@ -364,19 +394,47 @@ async fn network(
         })
     };
 
-    // Streams opened by the host (cursor).
+    // Clipboard (FR-17): only if both sides allow it. Opening our stream
+    // is what lets the host start sending its own.
+    let clip = (clipboard && shared.host.lock().expect("poisoned").clipboard)
+        .then(crate::clipboard::os_board)
+        .flatten()
+        .map(|b| Arc::new(crate::clipboard::ClipboardSync::start(&conn, b)));
+
+    // Chat (FR-24).
+    let chat_forward = {
+        let link = crate::chat::ChatLink::start(&conn);
+        tokio::spawn(async move {
+            while let Some(t) = chat_rx.recv().await {
+                link.send(&t);
+            }
+        })
+    };
+
+    // Streams opened by the host (cursor, clipboard, chat).
     let streams = {
         let conn = conn.clone();
         let proxy = proxy.clone();
+        let clip = clip.clone();
         tokio::spawn(async move {
             while let Ok(mut rx) = conn.accept_uni().await {
                 let mut tag = [0u8; 1];
                 if rx.read_exact(&mut tag).await.is_err() {
                     continue;
                 }
-                if relay_net::channel::Channel::from_u8(tag[0])
-                    == Some(relay_net::channel::Channel::Cursor)
-                {
+                let channel = relay_net::channel::Channel::from_u8(tag[0]);
+                if channel == Some(relay_net::channel::Channel::Chat) {
+                    let proxy = proxy.clone();
+                    crate::chat::receive(rx, move |m| proxy.send_event(UserEvent::Chat(m)).is_ok());
+                    continue;
+                }
+                if channel == Some(relay_net::channel::Channel::Clipboard) {
+                    if let Some(c) = &clip {
+                        c.receive(rx);
+                    }
+                    continue;
+                }
+                if channel == Some(relay_net::channel::Channel::Cursor) {
                     let proxy = proxy.clone();
                     tokio::spawn(async move {
                         // 256x256 RGBA plus headers.
@@ -453,6 +511,7 @@ async fn network(
     input_writer.abort();
     streams.abort();
     ui_forward.abort();
+    chat_forward.abort();
     let _ = tokio::time::timeout(Duration::from_millis(300), writer).await;
     conn.close(0u32.into(), b"viewer closed");
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;
@@ -529,6 +588,12 @@ async fn receive(
                     };
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::PathSwitched(_)) })) => switched.notify_one(),
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::Monitors(m)) })) => {
+                    *shared.displays.lock().expect("poisoned") = m.displays;
+                }
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::SelectMonitor(sel)) })) => {
+                    shared.current_display.store(sel.display_id, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return "host closed the connection".into(),
             },

@@ -80,6 +80,7 @@ struct Gpu {
     uniforms: wgpu::Buffer,
     planes: Option<Planes>,
     overlay: Overlay,
+    chat_panel: Overlay,
 }
 
 pub struct App {
@@ -96,6 +97,71 @@ pub struct App {
     cursor: RemoteCursor,
     ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
     quality: v1::QualityMode,
+    chat: Chat,
+}
+
+/// In-window chat (FR-24).
+struct Chat {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// (sent at ms, from me, text)
+    log: std::collections::VecDeque<(u64, bool, String)>,
+    unread: u32,
+    /// Open with the text being typed.
+    compose: Option<String>,
+}
+
+impl Chat {
+    const KEEP: usize = 50;
+    const SHOW: usize = 8;
+    const WRAP: usize = 64;
+
+    fn push(&mut self, at: u64, mine: bool, text: String) {
+        if self.log.len() == Self::KEEP {
+            self.log.pop_front();
+        }
+        self.log.push_back((at, mine, text));
+    }
+
+    fn lines(&self, host: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let from = self.log.len().saturating_sub(Self::SHOW);
+        for (at, mine, text) in self.log.iter().skip(from) {
+            let who = if *mine { "you" } else { host };
+            let mut first = true;
+            for part in text.split('\n') {
+                let chars: Vec<char> = part.chars().collect();
+                for chunk in chars
+                    .chunks(Self::WRAP)
+                    .map(|c| c.iter().collect::<String>())
+                    .chain(chars.is_empty().then(String::new))
+                {
+                    if first {
+                        out.push(format!("{} {who}: {chunk}", crate::chat::clock(*at)));
+                        first = false;
+                    } else {
+                        out.push(format!("      {chunk}"));
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push("(no messages yet)".into());
+        }
+        let typing: String = self
+            .compose
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .rev()
+            .take(Self::WRAP)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        out.push(format!("> {typing}_"));
+        out.push("Enter send  Esc close".into());
+        out
+    }
 }
 
 /// The Host's pointer, shown as the local OS cursor (§6 rule 5): the
@@ -260,9 +326,16 @@ impl App {
         quit: tokio::sync::oneshot::Sender<()>,
         input_tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
+        chat_tx: tokio::sync::mpsc::UnboundedSender<String>,
         opts: &ViewOptions,
     ) -> Self {
         Self {
+            chat: Chat {
+                tx: chat_tx,
+                log: std::collections::VecDeque::new(),
+                unread: 0,
+                compose: None,
+            },
             ui_tx,
             quality: opts.quality,
             input: InputState {
@@ -294,7 +367,106 @@ impl App {
         self.close_reason.as_deref().filter(|s| !s.is_empty())
     }
 
+    fn refresh_chat(&mut self) {
+        let host = self.shared.host_name.lock().expect("poisoned").clone();
+        let host: String = host.chars().take(20).collect();
+        let lines = self.chat.lines(&host);
+        let open = self.chat.compose.is_some();
+        let Some(g) = &mut self.gpu else { return };
+        g.chat_panel.visible = open;
+        if open {
+            let scale = g.window.scale_factor().round().max(1.0) as usize;
+            g.chat_panel.set_text(&g.device, &g.queue, &lines, scale);
+        }
+        g.draw();
+    }
+
+    /// While the chat panel is open, keys edit the message instead of
+    /// going to the host.
+    fn chat_key(&mut self, ev: &KeyEvent) {
+        if ev.state != ElementState::Pressed {
+            return;
+        }
+        let Some(buf) = self.chat.compose.as_mut() else {
+            return;
+        };
+        match ev.physical_key {
+            PhysicalKey::Code(KeyCode::Escape) => self.chat.compose = None,
+            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                let text = crate::chat::sanitize(buf);
+                buf.clear();
+                if !text.is_empty() {
+                    let _ = self.chat.tx.send(text.clone());
+                    self.chat.push(crate::chat::now_ms(), true, text);
+                }
+            }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                buf.pop();
+            }
+            _ => {
+                if let Some(t) = &ev.text
+                    && buf.chars().count() < crate::chat::MAX_CHARS
+                {
+                    buf.extend(t.chars().filter(|c| !c.is_control()));
+                }
+            }
+        }
+        self.refresh_chat();
+    }
+
+    /// Ask the host to switch displays (FR-21).
+    fn pick_monitor(&mut self, key: KeyCode) {
+        let displays = self.shared.displays.lock().expect("poisoned").clone();
+        if displays.len() < 2 {
+            return;
+        }
+        let cur = self
+            .shared
+            .current_display
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let idx = displays.iter().position(|d| d.id == cur).unwrap_or(0);
+        let next = match key {
+            KeyCode::KeyM => (idx + 1) % displays.len(),
+            other => {
+                let n = (other as usize).wrapping_sub(KeyCode::Digit1 as usize);
+                if n >= displays.len() {
+                    return;
+                }
+                n
+            }
+        };
+        let id = displays[next].id;
+        let _ = self.ui_tx.send(crate::auth::control(
+            v1::control_message::Msg::SelectMonitor(v1::SelectMonitor { display_id: id }),
+        ));
+        tracing::info!("switching to display {} of {}", next + 1, displays.len());
+    }
+
+    /// "display 2/3 · 2560x1440" for the title and overlay.
+    fn display_label(&self) -> String {
+        let displays = self.shared.displays.lock().expect("poisoned");
+        let cur = self
+            .shared
+            .current_display
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match displays.iter().position(|d| d.id == cur) {
+            Some(i) if displays.len() > 1 => {
+                let d = &displays[i];
+                format!(
+                    "display {}/{} · {}x{}",
+                    i + 1,
+                    displays.len(),
+                    d.width,
+                    d.height
+                )
+            }
+            Some(i) => format!("{}x{}", displays[i].width, displays[i].height),
+            None => String::new(),
+        }
+    }
+
     fn update_overlay(&mut self) {
+        let label = self.display_label();
         let Some(g) = &mut self.gpu else { return };
         if !g.overlay.visible {
             return;
@@ -312,7 +484,8 @@ impl App {
                 s.loss_pct, s.recovered, s.dropped
             ),
             format!("decode {:.1} ms  mode {:?}", s.decode_ms, self.quality),
-            "Ctrl+Alt+S stats  Ctrl+Alt+Q quality".to_string(),
+            label,
+            "Ctrl+Alt+ S stats  Q quality  M/1-9 monitor  C chat".to_string(),
         ];
         let scale = g.window.scale_factor().round().max(1.0) as usize;
         g.overlay.set_text(&g.device, &g.queue, &lines, scale);
@@ -325,11 +498,21 @@ impl App {
         let title = if gpu.planes.is_some() {
             let s = self.shared.stats.lock().expect("poisoned").clone();
             format!(
-                "Relay — {host} — {:.0} fps · {:.1} Mbit/s · RTT {:.0} ms · decode {:.1} ms · {}",
-                s.fps, s.mbps, s.rtt_ms, s.decode_ms, s.path
+                "Relay — {host} — {} — {:.0} fps · {:.1} Mbit/s · RTT {:.0} ms · decode {:.1} ms · {}",
+                self.display_label(),
+                s.fps,
+                s.mbps,
+                s.rtt_ms,
+                s.decode_ms,
+                s.path
             )
         } else {
             format!("Relay — {host} — {}", self.status)
+        };
+        let title = if self.chat.unread > 0 {
+            format!("✉ {} (Ctrl+Alt+C) · {title}", self.chat.unread)
+        } else {
+            title
         };
         gpu.window.set_title(&title);
         self.last_title = Instant::now();
@@ -593,6 +776,8 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let overlay = Overlay::new(&device, format);
+        let mut chat_panel = Overlay::new(&device, format);
+        chat_panel.bottom = true;
         Ok(Self {
             window,
             surface,
@@ -605,6 +790,7 @@ impl Gpu {
             uniforms,
             planes: None,
             overlay,
+            chat_panel,
         })
     }
 
@@ -842,6 +1028,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Cursor(m) => self.on_cursor(el, m),
+            UserEvent::Chat(m) => {
+                tracing::info!("chat from host: {}", m.text);
+                self.chat.push(m.sent_at_ms, false, m.text);
+                if self.chat.compose.is_none() {
+                    self.chat.unread += 1;
+                }
+                self.refresh_chat();
+                self.update_title();
+            }
             UserEvent::Status(s) => {
                 self.status = s;
                 self.update_title();
@@ -878,6 +1073,34 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        // FR-21: Ctrl+Alt+M next monitor, Ctrl+Alt+1…9 pick one.
+                        PhysicalKey::Code(
+                            code @ (KeyCode::KeyM
+                            | KeyCode::Digit1
+                            | KeyCode::Digit2
+                            | KeyCode::Digit3
+                            | KeyCode::Digit4
+                            | KeyCode::Digit5
+                            | KeyCode::Digit6
+                            | KeyCode::Digit7
+                            | KeyCode::Digit8
+                            | KeyCode::Digit9),
+                        ) => {
+                            self.pick_monitor(code);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            if self.chat.compose.take().is_none() {
+                                // Release anything held before keys stop
+                                // reaching the host.
+                                self.input.release_all();
+                                self.chat.compose = Some(String::new());
+                                self.chat.unread = 0;
+                            }
+                            self.refresh_chat();
+                            self.update_title();
+                            return;
+                        }
                         PhysicalKey::Code(KeyCode::KeyQ) => {
                             self.quality = match self.quality {
                                 v1::QualityMode::Speed => v1::QualityMode::Balanced,
@@ -908,6 +1131,10 @@ impl ApplicationHandler<UserEvent> for App {
                             (!fs).then_some(winit::window::Fullscreen::Borderless(None)),
                         );
                     }
+                    return;
+                }
+                if self.chat.compose.is_some() {
+                    self.chat_key(&event);
                     return;
                 }
                 if !is_synthetic && self.control_allowed() {
@@ -970,5 +1197,34 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn panel_lines_wrap_and_show_compose() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = Chat {
+            tx,
+            log: Default::default(),
+            unread: 0,
+            compose: Some("typing".into()),
+        };
+        assert_eq!(c.lines("host")[0], "(no messages yet)");
+        c.push(0, false, "x".repeat(70));
+        c.push(0, true, "two\nlines".into());
+        let l = c.lines("host");
+        assert!(l[0].ends_with(&format!("host: {}", "x".repeat(Chat::WRAP))));
+        assert_eq!(l[1].trim(), "xxxxxx");
+        assert!(l[2].ends_with("you: two"));
+        assert_eq!(l[3].trim(), "lines");
+        assert_eq!(l[4], "> typing_");
+        for _ in 0..60 {
+            c.push(0, true, "m".into());
+        }
+        assert_eq!(c.log.len(), Chat::KEEP);
     }
 }
