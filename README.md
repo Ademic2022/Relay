@@ -15,7 +15,7 @@ Built milestone by milestone (PRD §12).
 | M2 Remote control | mouse, keyboard (HID scancodes), scroll, ⌘/Ctrl mapping, HiDPI mapping, cursor channel written; not yet tried by hand |
 | M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
 | M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
-| M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
+| M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); "All displays" overview (FR-22) |
 | M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders with keep-both / overwrite / skip (FR-29) |
 | M7 Unattended access | permanent password + allow-list, agent mode, banner window, audit + diagnostic logs, reboot/safe mode/Ctrl+Alt+Del, auto-reconnect, Windows service + macOS launchd supervisor; tested locally without installing the service; reboot/login-screen acceptance needs real machines |
 | M8 Ship | settings (`relay config`), signed auto-update, macOS .pkg + Windows MSI scripts, release workflow, docs; unsigned builds only so far (no certificates), MSI not built here, Tauri UI not started |
@@ -84,7 +84,7 @@ Viewer keys (never sent to the host):
 | `Ctrl+Alt+Enter` | full screen |
 | `Ctrl+Alt+S` | stats overlay |
 | `Ctrl+Alt+Q` | cycle quality mode (Speed / Balanced / Quality; `--quality` sets the start) |
-| `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor |
+| `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor; with 2+ host monitors the last entry is "All displays", one picture of every screen as arranged on the host (scaled to fit 3840×2160, then by the ABR; copied on the CPU, so use single monitors for lowest latency) |
 | `Ctrl+Alt+C` | chat panel (typing goes to the chat while open; Enter sends, Esc closes) |
 | `Ctrl+Alt+F` | file manager: this computer ↔ host (Tab, Enter, Backspace, F5 copy file or folder, F6 if a name is taken, F7 mkdir, F2 rename, F8 delete, F9 cancel, Esc) |
 

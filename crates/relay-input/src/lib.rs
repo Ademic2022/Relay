@@ -85,6 +85,10 @@ pub enum InputError {
     Platform(String),
 }
 
+/// [`DisplayTarget::id`] of the Host's "all displays" view (FR-22): the
+/// rectangle is then the whole virtual desktop, in the same units.
+pub const ALL_DISPLAYS: u32 = u32::MAX;
+
 /// The Host display that normalised pointer coordinates refer to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayTarget {

@@ -480,6 +480,13 @@ impl App {
             .current_display
             .load(std::sync::atomic::Ordering::Relaxed);
         match displays.iter().position(|d| d.id == cur) {
+            // FR-22: the host's composite of every display.
+            Some(i) if displays[i].id == u32::MAX => {
+                format!(
+                    "all displays · {}x{}",
+                    displays[i].width, displays[i].height
+                )
+            }
             Some(i) if displays.len() > 1 => {
                 let d = &displays[i];
                 format!(

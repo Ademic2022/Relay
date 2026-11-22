@@ -128,11 +128,11 @@ pub fn read_stamp(y: &[u8], ys: usize, w: usize, h: usize) -> u32 {
 }
 
 #[derive(Debug)]
-struct MemFrame {
-    w: usize,
-    h: usize,
-    y: Vec<u8>,
-    uv: Vec<u8>,
+pub(crate) struct MemFrame {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) y: Vec<u8>,
+    pub(crate) uv: Vec<u8>,
 }
 
 impl NativeFrame for MemFrame {
@@ -152,7 +152,6 @@ impl NativeFrame for MemFrame {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn make_frame(
     w: usize,
     h: usize,
@@ -160,47 +159,12 @@ fn make_frame(
     ms: u32,
     noise: bool,
 ) -> Result<Arc<dyn NativeFrame>, CaptureError> {
-    #![allow(unsafe_code)]
-    use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
-    const FMT_420V: u32 = u32::from_be_bytes(*b"420v");
-    let pb = CVPixelBuffer::create(w, h, FMT_420V)
-        .map_err(|e| CaptureError::Platform(format!("CVPixelBufferCreate: {e}")))?;
-    {
-        let mut g = pb
-            .lock(CVPixelBufferLockFlags::from_bits(0))
-            .map_err(|e| CaptureError::Platform(format!("lock: {e}")))?;
-        let (ys, uvs) = (g.bytes_per_row_of_plane(0), g.bytes_per_row_of_plane(1));
-        let (yp, uvp) = match (
-            g.base_address_of_plane_mut(0),
-            g.base_address_of_plane_mut(1),
-        ) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Err(CaptureError::Platform("null plane".into())),
-        };
-        // SAFETY: planes are locked for writing; sizes from CoreVideo.
-        let (y, uv) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(yp, ys * h),
-                std::slice::from_raw_parts_mut(uvp, uvs * h / 2),
-            )
-        };
+    crate::alloc_nv12(w, h, &mut |y, ys, uv, uvs| {
         draw(y, ys, uv, uvs, w, h, n, ms);
         if noise {
             add_noise(y, ys, w, h, n);
         }
-    }
-    Ok(Arc::new(crate::macos::MacFrame { pixel_buffer: pb }))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn make_frame(
-    w: usize,
-    h: usize,
-    n: u64,
-    ms: u32,
-    noise: bool,
-) -> Result<Arc<dyn NativeFrame>, CaptureError> {
-    Ok(mem_frame_with(w, h, n, ms, noise))
+    })
 }
 
 /// In-memory frame for tests on any OS.

@@ -47,10 +47,20 @@ pub struct Options {
 }
 
 fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCapturer>> {
-    Ok(match opts.test_pattern {
-        Some((w, h)) => Box::new(relay_capture::pattern::PatternCapturer::new(w, h, opts.fps)),
-        None => relay_capture::platform_capturer().context("screen capture unavailable")?,
-    })
+    let (test_pattern, fps) = (opts.test_pattern, opts.fps);
+    let make =
+        move || -> Result<Box<dyn relay_capture::ScreenCapturer>, relay_capture::CaptureError> {
+            Ok(match test_pattern {
+                Some((w, h)) => Box::new(relay_capture::pattern::PatternCapturer::new(w, h, fps)),
+                None => relay_capture::platform_capturer()?,
+            })
+        };
+    let inner = make().context("screen capture unavailable")?;
+    // FR-22: adds "All displays" when there are two or more.
+    Ok(Box::new(relay_capture::multi::Multi::new(
+        inner,
+        Box::new(make),
+    )))
 }
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
@@ -633,7 +643,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         })
     };
     // Input follows the selected display (FR-21).
-    let (target_tx, target_rx) = tokio::sync::watch::channel(target_of(display));
+    let (target_tx, target_rx) = tokio::sync::watch::channel(target_of(display, &st.displays));
     let input_task = tokio::spawn(crate::host_input::serve(
         conn.clone(),
         target_rx,
@@ -804,8 +814,12 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                     // FR-21: switch the captured display; only it is encoded.
                     if let Some(d) = st.displays.iter().find(|d| d.id == sel.display_id) {
                         shared.display_id.store(d.id, Ordering::Relaxed);
-                        let _ = target_tx.send(target_of(d));
-                        println!("  Sharing display {} ({}x{}).", d.id, d.width, d.height);
+                        let _ = target_tx.send(target_of(d, &st.displays));
+                        if d.id == relay_capture::multi::ALL_DISPLAYS {
+                            println!("  Sharing all displays ({}x{} overview).", d.width, d.height);
+                        } else {
+                            println!("  Sharing display {} ({}x{}).", d.id, d.width, d.height);
+                        }
                         let _ = quic::send_msg(&mut tx, &control(Msg::SelectMonitor(v1::SelectMonitor { display_id: d.id }))).await;
                     }
                 }
@@ -872,7 +886,27 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     Ok(SessionOutcome::Ended { quit })
 }
 
-fn target_of(d: &relay_capture::DisplayInfo) -> relay_input::DisplayTarget {
+fn target_of(
+    d: &relay_capture::DisplayInfo,
+    all: &[relay_capture::DisplayInfo],
+) -> relay_input::DisplayTarget {
+    use relay_capture::multi::{ALL_DISPLAYS, desktop_bounds};
+    if d.id == ALL_DISPLAYS {
+        // FR-22: the composite maps linearly onto the whole desktop.
+        let real: Vec<_> = all
+            .iter()
+            .filter(|x| x.id != ALL_DISPLAYS)
+            .cloned()
+            .collect();
+        let (x, y, w, h) = desktop_bounds(&real);
+        return relay_input::DisplayTarget {
+            id: relay_input::ALL_DISPLAYS,
+            x: x.round() as i32,
+            y: y.round() as i32,
+            width: w.round() as u32,
+            height: h.round() as u32,
+        };
+    }
     relay_input::DisplayTarget {
         id: d.id,
         x: d.x,

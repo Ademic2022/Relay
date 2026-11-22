@@ -185,14 +185,20 @@ pub fn run(
     let mut current = display_id;
     let mut size = native_of(cap.as_ref(), display_id)?;
     let mut scale_milli = 1000;
-    let new_encoder = |(w, h): (u32, u32), kbps: u32| {
+    // The composite view (FR-22) is drawn in system memory except on
+    // macOS, where it is an IOSurface the hardware encoder takes.
+    let cpu = |id: u32| {
+        params.cpu_source
+            || (id == relay_capture::multi::ALL_DISPLAYS && !cfg!(target_os = "macos"))
+    };
+    let new_encoder = |(w, h): (u32, u32), kbps: u32, id: u32| {
         make_encoder(
             params.codec,
             EncoderConfig::low_latency(Codec::H264, w, h, params.max_fps, kbps),
-            params.cpu_source,
+            cpu(id),
         )
     };
-    let mut enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed))?;
+    let mut enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed), current)?;
 
     let mut frame_no: u32 = 0;
     let mut last: Option<CapturedFrame> = None;
@@ -213,7 +219,7 @@ pub fn run(
             {
                 size = s;
             }
-            enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed))?;
+            enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed), current)?;
             last = None;
             ctl.force_key.store(true, Ordering::Relaxed);
             tracing::info!("now capturing display {want} at {}x{}", size.0, size.1);
@@ -245,7 +251,7 @@ pub fn run(
                 Ok(new) => {
                     scale_milli = want_scale;
                     size = new;
-                    enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed))?;
+                    enc = new_encoder(size, ctl.bitrate_kbps.load(Ordering::Relaxed), current)?;
                     last = None;
                     tracing::info!(
                         "resolution {}x{} (scale {:.2})",

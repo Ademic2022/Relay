@@ -17,6 +17,7 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_cursor;
 pub mod mock;
+pub mod multi;
 pub mod pattern;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -187,6 +188,67 @@ pub trait ScreenCapturer: Send {
 pub fn scaled_size((w, h): (u32, u32), scale: f32) -> (u32, u32) {
     let f = |v: u32| (((v as f32 * scale.clamp(0.1, 1.0)) as u32) & !1).max(2);
     (f(w), f(h))
+}
+
+/// Writes NV12 planes: `(y, y_stride, uv, uv_stride)`.
+pub type FillNv12<'a> = &'a mut dyn FnMut(&mut [u8], usize, &mut [u8], usize);
+
+/// A new NV12 frame of `w`×`h` filled by `fill(y, y_stride, uv,
+/// uv_stride)`: IOSurface-backed on macOS (so VideoToolbox takes it without
+/// a copy), system memory elsewhere.
+pub fn alloc_nv12(
+    w: usize,
+    h: usize,
+    fill: FillNv12<'_>,
+) -> Result<Arc<dyn NativeFrame>, CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+        #![allow(unsafe_code)]
+        use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+        const FMT_420V: u32 = u32::from_be_bytes(*b"420v");
+        let pb = CVPixelBuffer::create(w, h, FMT_420V)
+            .map_err(|e| CaptureError::Platform(format!("CVPixelBufferCreate: {e}")))?;
+        {
+            let mut g = pb
+                .lock(CVPixelBufferLockFlags::from_bits(0))
+                .map_err(|e| CaptureError::Platform(format!("lock: {e}")))?;
+            let (ys, uvs) = (g.bytes_per_row_of_plane(0), g.bytes_per_row_of_plane(1));
+            let (yp, uvp) = match (
+                g.base_address_of_plane_mut(0),
+                g.base_address_of_plane_mut(1),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Err(CaptureError::Platform("null plane".into())),
+            };
+            // SAFETY: planes are locked for writing; sizes from CoreVideo.
+            let (y, uv) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(yp, ys * h),
+                    std::slice::from_raw_parts_mut(uvp, uvs * h / 2),
+                )
+            };
+            fill(y, ys, uv, uvs);
+        }
+        Ok(Arc::new(crate::macos::MacFrame { pixel_buffer: pb }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut y = vec![0u8; w * h];
+        let mut uv = vec![0u8; w * h / 2];
+        fill(&mut y, w, &mut uv, w);
+        Ok(Arc::new(pattern::MemFrame { w, h, y, uv }))
+    }
+}
+
+/// Size of a display in desktop (input) units: points on macOS, physical
+/// pixels on Windows. Display positions use the same units.
+pub fn desktop_size(d: &DisplayInfo) -> (f64, f64) {
+    if cfg!(target_os = "macos") {
+        let s = f64::from(d.scale.max(0.1));
+        (f64::from(d.width) / s, f64::from(d.height) / s)
+    } else {
+        (f64::from(d.width), f64::from(d.height))
+    }
 }
 
 /// The default capturer for this OS.

@@ -84,13 +84,13 @@ async fn run(up: Link, down: Link, start_kbps: u32, secs: u64) -> Outcome {
     run_with(up, down, start_kbps, secs, None).await
 }
 
-/// `switch`: after this long, capture display 2 instead (multi-monitor).
+/// `switch`: after this long, capture that display instead (multi-monitor).
 async fn run_with(
     up: Link,
     down: Link,
     start_kbps: u32,
     secs: u64,
-    switch: Option<Duration>,
+    switch: Option<(Duration, u32)>,
 ) -> Outcome {
     let _serial = SERIAL.lock().await;
     let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -108,15 +108,20 @@ async fn run_with(
         let sender = {
             let (conn, sc) = (conn.clone(), sc.clone());
             std::thread::spawn(move || {
-                let mut cap =
-                    relay_capture::pattern::PatternCapturer::new(W, H, FPS).with_display(480, 270);
-                cap.noise = true;
+                let make = || {
+                    let mut cap = relay_capture::pattern::PatternCapturer::new(W, H, FPS)
+                        .with_display(480, 270);
+                    cap.noise = true;
+                    Ok(Box::new(cap.cpu_frames()) as Box<dyn relay_capture::ScreenCapturer>)
+                };
+                // As in the host: with "All displays" (FR-22).
+                let cap = relay_capture::multi::Multi::new(make().unwrap(), Box::new(make));
                 let params = SenderParams {
                     codec: CodecChoice::Sw,
                     max_fps: FPS,
                     cpu_source: true,
                 };
-                let r = crate::sender::run(&conn, Box::new(cap.cpu_frames()), 1, params, &sc, None);
+                let r = crate::sender::run(&conn, Box::new(cap), 1, params, &sc, None);
                 if let Err(e) = &r {
                     eprintln!("sender failed: {e:#}");
                 }
@@ -201,13 +206,13 @@ async fn run_with(
     let mut fb = crate::feedback::Feedback::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let switch_at = switch.map(|d| tokio::time::Instant::now() + d);
+    let switch_at = switch.map(|(d, id)| (tokio::time::Instant::now() + d, id));
     loop {
-        if let Some(at) = switch_at
+        if let Some((at, id)) = switch_at
             && tokio::time::Instant::now() >= at
-            && ctl_shared.display_id.load(Ordering::Relaxed) != 2
+            && ctl_shared.display_id.load(Ordering::Relaxed) != id
         {
-            ctl_shared.display_id.store(2, Ordering::Relaxed);
+            ctl_shared.display_id.store(id, Ordering::Relaxed);
         }
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
@@ -360,7 +365,7 @@ async fn monitor_switch_changes_the_stream() {
         Link::default(),
         3_000,
         7,
-        Some(Duration::from_secs(3)),
+        Some((Duration::from_secs(3), 2)),
     )
     .await;
     let first = o.sizes.first().copied();
@@ -382,5 +387,47 @@ async fn monitor_switch_changes_the_stream() {
         after.len() > limit(20, 5),
         "display 2 keeps streaming: {} frames",
         after.len()
+    );
+}
+
+/// FR-22: the "All displays" view streams one composite of both displays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(debug_assertions, ignore = "timing test: cargo test --release")]
+async fn all_displays_view_streams_a_composite() {
+    let o = run_with(
+        Link::default(),
+        Link::default(),
+        3_000,
+        6,
+        Some((Duration::from_secs(2), relay_capture::multi::ALL_DISPLAYS)),
+    )
+    .await;
+    let all = relay_capture::pattern::PatternCapturer::new(W, H, FPS).with_display(480, 270);
+    let l =
+        relay_capture::multi::layout(&relay_capture::ScreenCapturer::displays(&all).unwrap(), 1.0);
+    eprintln!(
+        "[all displays] {:?} → {:?}, {} frames",
+        o.sizes.first(),
+        o.sizes.last(),
+        o.sizes.len()
+    );
+    assert_eq!(
+        o.sizes.first().copied(),
+        Some((W, H)),
+        "starts on display 1"
+    );
+    assert_eq!(
+        o.sizes.last().copied(),
+        Some((l.width, l.height)),
+        "ends on the composite"
+    );
+    let after = o
+        .sizes
+        .iter()
+        .filter(|s| **s == (l.width, l.height))
+        .count();
+    assert!(
+        after > limit(20, 5),
+        "composite keeps streaming: {after} frames"
     );
 }

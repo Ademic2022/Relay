@@ -338,6 +338,19 @@ impl CgEventInjector {
 impl InputInjector for CgEventInjector {
     fn set_display(&mut self, target: DisplayTarget) {
         // Quartz event coordinates are global display points.
+        if target.id == crate::ALL_DISPLAYS {
+            self.bounds = CGRect {
+                origin: CGPoint {
+                    x: f64::from(target.x),
+                    y: f64::from(target.y),
+                },
+                size: CGSize {
+                    width: f64::from(target.width),
+                    height: f64::from(target.height),
+                },
+            };
+            return;
+        }
         // SAFETY: plain getter; returns an empty rect for unknown IDs.
         let b = unsafe { CGDisplayBounds(target.id) };
         if b.size.width > 0.0 {
