@@ -7,7 +7,10 @@
 use bytes::Bytes;
 use relay_capture::CapturedFrame;
 
+#[cfg(target_os = "windows")]
+pub mod mediafoundation;
 pub mod mock;
+#[cfg(feature = "openh264")]
 pub mod openh264;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;

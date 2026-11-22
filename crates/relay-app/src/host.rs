@@ -52,7 +52,7 @@ fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCaptu
 pub fn run(opts: Options) -> anyhow::Result<()> {
     let cap = capturer(&opts)?;
     let displays = cap.displays().map_err(|e| match e {
-        relay_capture::CaptureError::PermissionDenied => anyhow::anyhow!(
+        relay_capture::CaptureError::PermissionDenied if cfg!(target_os = "macos") => anyhow::anyhow!(
             "Screen Recording permission is not granted.\n  Open System Settings → Privacy & Security → Screen & System Audio Recording,\n  enable your terminal app, then restart it."
         ),
         e => e.into(),
@@ -359,7 +359,29 @@ struct PipelineShared {
     error: Mutex<Option<String>>,
 }
 
-fn make_encoder(choice: CodecChoice, cfg: EncoderConfig) -> anyhow::Result<Box<dyn Encoder>> {
+fn make_encoder(
+    choice: CodecChoice,
+    cfg: EncoderConfig,
+    test_pattern: bool,
+) -> anyhow::Result<Box<dyn Encoder>> {
+    // On Windows the test pattern lives in system memory, not a D3D11
+    // texture, so it goes through the software encoder.
+    let choice = if test_pattern && !cfg!(target_os = "macos") && choice == CodecChoice::Auto {
+        CodecChoice::Sw
+    } else {
+        choice
+    };
+    #[cfg(target_os = "windows")]
+    if choice != CodecChoice::Sw {
+        match relay_codec::mediafoundation::MediaFoundationEncoder::new(cfg.clone()) {
+            Ok(e) => {
+                tracing::info!("encoder: Media Foundation (hardware)");
+                return Ok(Box::new(e));
+            }
+            Err(e) if choice == CodecChoice::Hw => bail!("hardware encoder unavailable: {e}"),
+            Err(e) => tracing::warn!("hardware encoder unavailable ({e}); using openh264"),
+        }
+    }
     #[cfg(target_os = "macos")]
     if choice != CodecChoice::Sw {
         match relay_codec::videotoolbox::VideoToolboxEncoder::new(cfg.clone()) {
@@ -371,7 +393,7 @@ fn make_encoder(choice: CodecChoice, cfg: EncoderConfig) -> anyhow::Result<Box<d
             Err(e) => tracing::warn!("hardware encoder unavailable ({e}); using openh264"),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     if choice == CodecChoice::Hw {
         bail!("hardware encoder not implemented on this OS yet");
     }
@@ -392,6 +414,7 @@ fn pipeline(
     let mut enc = make_encoder(
         opts.codec,
         EncoderConfig::low_latency(Codec::H264, w, h, opts.fps, opts.bitrate_kbps),
+        opts.test_pattern.is_some(),
     )?;
 
     let mut frame_no: u32 = 0;

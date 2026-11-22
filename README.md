@@ -11,7 +11,7 @@ Built milestone by milestone (PRD §12).
 | Milestone | State |
 |---|---|
 | M0 Skeleton: workspace, traits, protobuf, CI | done |
-| M1 LAN screen view | macOS host + viewer working; Windows capture/encode not started; acceptance not yet run on two machines |
+| M1 LAN screen view | macOS host + viewer working; Windows capture (DXGI) + encoder (Media Foundation) written, never run; acceptance not yet run on two machines |
 | M2–M8 | not started |
 
 ## Layout
@@ -21,8 +21,8 @@ Built milestone by milestone (PRD §12).
 | `relay-proto` | protobuf wire protocol (`proto/relay.proto`), length-delimited codec with size cap |
 | `relay-crypto` | Ed25519 device keys, 9-digit Device IDs, key pinning, one-time / permanent passwords, keystore trait, PAKE interface |
 | `relay-net` | QUIC endpoints (quinn, BBR, small datagram buffer), channel map, video datagram framing, newest-wins reassembly |
-| `relay-capture` | `ScreenCapturer` trait; ScreenCaptureKit backend (macOS); test pattern; Windows stub |
-| `relay-codec` | `Encoder` / `Decoder` traits; VideoToolbox hardware encoder; openh264 software encoder/decoder |
+| `relay-capture` | `ScreenCapturer` trait; ScreenCaptureKit (macOS); DXGI Desktop Duplication + GPU NV12 conversion (Windows); test pattern |
+| `relay-codec` | `Encoder` / `Decoder` traits; VideoToolbox (macOS) and Media Foundation (Windows) hardware encoders; openh264 software encoder/decoder |
 | `relay-input` | input model (USB HID usages), ⌘/Ctrl mapping, HiDPI coordinate mapping, `InputInjector` trait |
 | `relay-session` | newest-wins channel, ABR controller, IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
 | `relay-render` | viewer present-mode policy (wgpu viewer in M1) |
@@ -31,7 +31,7 @@ Built milestone by milestone (PRD §12).
 | `relay-app` | `relay` binary: M1 host (capture → encode → QUIC datagrams) and wgpu viewer |
 | `tools/latency-bench` | latency percentiles and release regression gate |
 
-## Try it (M1, macOS)
+## Try it (M1)
 
 ```sh
 cargo build --release -p relay-app
@@ -43,6 +43,10 @@ cargo build --release -p relay-app
 # On the viewing machine:
 ./target/release/relay view <ip> --code <code>
 ```
+
+Windows works the same way (`target\release\relay.exe`). Allow `relay.exe` through Windows
+Firewall for UDP 21118. The Windows host does not show the mouse pointer yet: DXGI leaves it
+out of the image, and the cursor channel arrives in M2.
 
 Without Screen Recording permission, `relay host --test-pattern 1920x1080` streams a synthetic
 pattern. `relay view ... --measure` reads the pattern's timestamp stripe and logs latency

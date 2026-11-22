@@ -528,7 +528,7 @@ impl Encoder for VideoToolboxEncoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openh264"))]
 mod tests {
     use super::*;
     use crate::openh264::OpenH264Decoder;
@@ -606,7 +606,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openh264"))]
 mod stamp_tests {
     use super::*;
     use crate::openh264::OpenH264Decoder;

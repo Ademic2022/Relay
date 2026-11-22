@@ -12,7 +12,15 @@ publish.workspace = true
 relay-capture.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
-openh264.workspace = true
+openh264 = { workspace = true, optional = true }
+
+[features]
+default = ["openh264"]
+# Software H.264 fallback (C++; needs a native toolchain).
+openh264 = ["dep:openh264"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 screencapturekit = "12"

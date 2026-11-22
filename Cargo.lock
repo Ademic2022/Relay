@@ -2243,6 +2243,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+ "windows",
  "winit",
 ]
 
@@ -2253,6 +2254,7 @@ dependencies = [
  "bytes",
  "screencapturekit",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
@@ -2264,6 +2266,7 @@ dependencies = [
  "relay-capture",
  "screencapturekit",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
