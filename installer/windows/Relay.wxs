@@ -2,7 +2,8 @@
   Relay MSI (WiX Toolset v4+), per-machine (PRD §10 Windows).
 
   Build: installer/windows/build.ps1
-  - installs relay.exe to "C:\Program Files\Relay"
+  - installs relay.exe (engine) and relay-app.exe (desktop app) to
+    "C:\Program Files\Relay", with a Start menu shortcut to the app
   - adds it to the system PATH
   - opens Windows Firewall for relay.exe (UDP, for QUIC and hole punching)
   - on uninstall, removes unattended access first (service + permanent
@@ -24,8 +25,17 @@
           <Environment Id="RelayPath" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
                        Action="set" System="yes" Permanent="no" />
         </Component>
+        <!-- The desktop app; it runs relay.exe from this folder. -->
+        <Component Id="RelayAppExe" Guid="8E4B2C17-5D3A-4F6E-A1B9-2C7D8E9F0A1B">
+          <File Id="RelayAppExeFile" Source="$(var.RelayAppExe)" KeyPath="yes">
+            <Shortcut Id="RelayStartMenu" Directory="ProgramMenuFolder" Name="Relay"
+                      Description="Remote desktop" WorkingDirectory="INSTALLFOLDER" />
+          </File>
+        </Component>
       </Directory>
     </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder" />
 
     <!-- FR-38: uninstall removes the service and invalidates the password. -->
     <CustomAction Id="DisableUnattended" FileRef="RelayExeFile"
@@ -37,6 +47,7 @@
 
     <Feature Id="Main" Title="Relay">
       <ComponentRef Id="RelayExe" />
+      <ComponentRef Id="RelayAppExe" />
     </Feature>
   </Package>
 </Wix>

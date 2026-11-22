@@ -9,8 +9,12 @@ $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..\..")
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-cargo build --release -p relay-app
+# Engine (relay.exe) and the desktop app (relay-app.exe, Tauri; uses the
+# WebView2 runtime that ships with Windows 10/11).
+cargo build --release -p relay-app -p relay-ui
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $exe = "target\release\relay.exe"
+$app = "target\release\relay-app.exe"
 $out = "target\installer\windows"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
@@ -25,9 +29,10 @@ function Sign($path) {
 }
 
 Sign $exe
+Sign $app
 $msi = "$out\Relay-$version.msi"
 wix build installer\windows\Relay.wxs -arch x64 -ext WixToolset.Firewall.wixext `
-  -d Version=$version -d RelayExe=$exe -o $msi
+  -d Version=$version -d RelayExe=$exe -d RelayAppExe=$app -o $msi
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 Sign $msi
 
