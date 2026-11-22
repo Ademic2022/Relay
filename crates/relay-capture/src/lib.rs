@@ -14,6 +14,8 @@ use bytes::Bytes;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod macos_cursor;
 pub mod mock;
 pub mod pattern;
 #[cfg(target_os = "windows")]
@@ -109,8 +111,64 @@ pub enum CaptureError {
     Platform(String),
 }
 
+/// A cursor image, straight-alpha RGBA, in Host pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub rgba: Vec<u8>,
+    /// Content hash; the Controller caches shapes by it.
+    pub hash: u64,
+    /// Pixels per point of the image (2 for Retina cursors, else 1), in
+    /// thousandths, so the Controller can size it to the video.
+    pub scale_milli: u32,
+}
+
+impl CursorImage {
+    pub fn new(width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: Vec<u8>, scale: f32) -> Self {
+        // FNV-1a: fast, stable, collision-resistant enough for a cache key.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in width
+            .to_le_bytes()
+            .iter()
+            .chain(&height.to_le_bytes())
+            .chain(&rgba)
+        {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        Self {
+            width,
+            height,
+            hot_x,
+            hot_y,
+            rgba,
+            hash,
+            scale_milli: (scale * 1000.0).round() as u32,
+        }
+    }
+}
+
+/// Pointer state on the captured display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorState {
+    pub visible: bool,
+    /// Normalised 0..1 within the captured display.
+    pub x: f32,
+    pub y: f32,
+    pub image: Option<std::sync::Arc<CursorImage>>,
+}
+
 /// A screen capturer for one display at a time.
 pub trait ScreenCapturer: Send {
+    /// Current pointer state, if the backend tracks it separately from the
+    /// video (§6 rule 5). Polled after each `next_frame`.
+    fn cursor(&mut self) -> Option<CursorState> {
+        None
+    }
+
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError>;
     /// Start (or switch to) capturing `display_id`. Only that display is
     /// captured (FR-21).

@@ -37,6 +37,7 @@ pub struct Options {
     pub codec: CodecChoice,
     pub bitrate_kbps: u32,
     pub fps: u32,
+    pub view_only: bool,
 }
 
 /// Keep-alive cadence when the screen is static (§6 rule 4).
@@ -241,9 +242,73 @@ async fn session(
 
     let started = Instant::now();
     audit(&format!("SESSION START {name} (attended, direct)"));
-    println!("  ● Being viewed by {name}. Press Ctrl+C to end the session.");
+    println!(
+        "  ● {} by {name}. Press Ctrl+C to end the session.",
+        if opts.view_only {
+            "Being viewed"
+        } else {
+            "Being viewed and controlled"
+        }
+    );
 
     let (w, h) = (display.width & !1, display.height & !1);
+    quic::send_msg(
+        &mut tx,
+        &control(Msg::Hello(v1::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: hostname(),
+            os: if cfg!(target_os = "macos") {
+                v1::OsKind::Macos
+            } else {
+                v1::OsKind::Windows
+            } as i32,
+            ..Default::default()
+        })),
+    )
+    .await?;
+    quic::send_msg(
+        &mut tx,
+        &control(Msg::Permissions(v1::Permissions {
+            view: true,
+            control: !opts.view_only,
+            clipboard: false,
+            file_transfer: false,
+        })),
+    )
+    .await?;
+    // Cursor channel (§6 rule 5): its own stream, below input priority.
+    let (cursor_tx, mut cursor_rx) = tokio::sync::mpsc::unbounded_channel::<v1::CursorMessage>();
+    let cursor_task = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let Ok(mut s) = conn.open_uni().await else {
+                return;
+            };
+            let _ = s.set_priority(relay_net::channel::Channel::Cursor.priority());
+            if s.write_all(&[relay_net::channel::Channel::Cursor as u8])
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(m) = cursor_rx.recv().await {
+                if quic::send_msg(&mut s, &m).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    let input_task = tokio::spawn(crate::host_input::serve(
+        conn.clone(),
+        relay_input::DisplayTarget {
+            id: display.id,
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+        },
+        !opts.view_only,
+    ));
     quic::send_msg(
         &mut tx,
         &control(Msg::Monitors(v1::MonitorList {
@@ -284,11 +349,12 @@ async fn session(
         let conn = conn.clone();
         let opts = opts.clone();
         let display_id = display.id;
+        let cursor_tx = cursor_tx.clone();
         std::thread::Builder::new()
             .name("relay-encode".into())
             .spawn(move || {
                 rt::set_realtime();
-                if let Err(e) = pipeline(&conn, &opts, display_id, w, h, &shared) {
+                if let Err(e) = pipeline(&conn, &opts, display_id, w, h, &shared, &cursor_tx) {
                     *shared.error.lock().expect("poisoned") = Some(format!("{e:#}"));
                     conn.close(2u32.into(), b"host pipeline error");
                 }
@@ -338,6 +404,9 @@ async fn session(
         }
     };
     shared.stop.store(true, Ordering::Relaxed);
+    input_task.abort();
+    drop(cursor_tx);
+    cursor_task.abort();
     let _ = tokio::task::spawn_blocking(move || pipeline.join()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     conn.close(0u32.into(), b"session ended");
@@ -408,6 +477,7 @@ fn pipeline(
     w: u32,
     h: u32,
     shared: &PipelineShared,
+    cursor_tx: &tokio::sync::mpsc::UnboundedSender<v1::CursorMessage>,
 ) -> anyhow::Result<()> {
     let mut cap = capturer(opts)?;
     cap.select(display_id)?;
@@ -421,12 +491,17 @@ fn pipeline(
     let mut last: Option<CapturedFrame> = None;
     let mut last_sent = Instant::now();
     let mut stats = Stats::new();
+    let mut cursor = CursorSync::default();
 
     while !shared.stop.load(Ordering::Relaxed) {
         let frame = {
             let _s = tracing::trace_span!("capture_wait").entered();
-            cap.next_frame(Duration::from_millis(100))?
+            // Short wait so pointer-only changes are picked up promptly.
+            cap.next_frame(Duration::from_millis(16))?
         };
+        if let Some(c) = cap.cursor() {
+            cursor.update(&c, cursor_tx);
+        }
         let (frame, keepalive) = match frame {
             Some(f) => (f, false),
             // Static screen: nothing to send except a 1 fps keep-alive.
@@ -490,6 +565,51 @@ fn pipeline(
     Ok(())
 }
 
+/// Sends cursor shape/position changes; shapes are sent in full once and
+/// then referenced by hash.
+#[derive(Default)]
+struct CursorSync {
+    known: std::collections::HashSet<u64>,
+    last: Option<(bool, u64, (f32, f32))>,
+}
+
+impl CursorSync {
+    fn update(
+        &mut self,
+        c: &relay_capture::CursorState,
+        tx: &tokio::sync::mpsc::UnboundedSender<v1::CursorMessage>,
+    ) {
+        let hash = c.image.as_ref().map_or(0, |i| i.hash);
+        if let Some(img) = &c.image
+            && self.known.insert(img.hash)
+        {
+            let _ = tx.send(v1::CursorMessage {
+                msg: Some(v1::cursor_message::Msg::Shape(v1::CursorShape {
+                    hash: img.hash,
+                    width: img.width,
+                    height: img.height,
+                    hotspot_x: img.hot_x,
+                    hotspot_y: img.hot_y,
+                    rgba: img.rgba.clone().into(),
+                    scale_milli: img.scale_milli,
+                })),
+            });
+        }
+        let now = (c.visible, hash, (c.x, c.y));
+        if self.last != Some(now) {
+            self.last = Some(now);
+            let _ = tx.send(v1::CursorMessage {
+                msg: Some(v1::cursor_message::Msg::Position(v1::CursorPosition {
+                    x: c.x,
+                    y: c.y,
+                    visible: c.visible,
+                    shape_hash: hash,
+                })),
+            });
+        }
+    }
+}
+
 struct Stats {
     since: Instant,
     frames: u32,
@@ -536,6 +656,19 @@ impl Stats {
         );
         *self = Self::new();
     }
+}
+
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .unwrap_or_else(|| "relay-host".into())
 }
 
 fn audit(line: &str) {

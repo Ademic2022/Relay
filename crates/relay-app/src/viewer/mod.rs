@@ -22,6 +22,7 @@ use tokio::sync::mpsc as tmpsc;
 
 use crate::clock;
 
+mod keys;
 mod render;
 
 /// How long a partially received frame may wait for missing slices.
@@ -33,6 +34,7 @@ const DECODE_QUEUE: usize = 6;
 #[derive(Debug)]
 pub enum UserEvent {
     Frame,
+    Cursor(v1::CursorMessage),
     Status(String),
     Closed(String),
 }
@@ -52,9 +54,27 @@ pub struct Shared {
     pub stats: Mutex<LiveStats>,
     pub frames: latest::Receiver<DecodedFrame>,
     pub host_name: Mutex<String>,
+    pub host: Mutex<HostInfo>,
 }
 
-pub fn run(addr: SocketAddr, code: String, measure: bool) -> anyhow::Result<()> {
+/// What the host told us about itself during setup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostInfo {
+    pub os: Option<relay_input::Os>,
+    pub control: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewOptions {
+    pub addr: SocketAddr,
+    pub code: String,
+    pub measure: bool,
+    pub cmd_ctrl_swap: bool,
+    pub translate_chars: bool,
+}
+
+pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
+    let ViewOptions { addr, code, .. } = opts.clone();
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let (frame_tx, frame_rx) = latest::channel::<DecodedFrame>();
@@ -65,8 +85,12 @@ pub fn run(addr: SocketAddr, code: String, measure: bool) -> anyhow::Result<()> 
         }),
         frames: frame_rx,
         host_name: Mutex::new(addr.to_string()),
+        host: Mutex::new(HostInfo::default()),
     });
     let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+    // Input from the window to the network. Unbounded: events are tiny and
+    // must never be dropped or block the UI thread.
+    let (input_tx, input_rx) = tmpsc::unbounded_channel::<v1::InputEvent>();
 
     let net = {
         let proxy = proxy.clone();
@@ -91,6 +115,7 @@ pub fn run(addr: SocketAddr, code: String, measure: bool) -> anyhow::Result<()> 
                     proxy.clone(),
                     shared,
                     quit_rx,
+                    input_rx,
                 ));
                 let msg = match res {
                     Ok(m) => m,
@@ -100,7 +125,7 @@ pub fn run(addr: SocketAddr, code: String, measure: bool) -> anyhow::Result<()> 
             })?
     };
 
-    let mut app = render::App::new(shared, quit_tx, measure);
+    let mut app = render::App::new(shared, quit_tx, input_tx, &opts);
     event_loop.run_app(&mut app)?;
     let _ = net.join();
     if let Some(msg) = app.close_reason() {
@@ -120,6 +145,7 @@ async fn network(
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
     mut quit: tokio::sync::oneshot::Receiver<()>,
+    mut input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
 ) -> anyhow::Result<String> {
     let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {addr}…")));
     let (ep, seen) = quic::client()?;
@@ -184,11 +210,32 @@ async fn network(
                 msg: Some(Msg::StreamConfig(c)),
             }) => stream_cfg = Some(c),
             Some(v1::ControlMessage {
+                msg: Some(Msg::Hello(h)),
+            }) => {
+                let os = match v1::OsKind::try_from(h.os) {
+                    Ok(v1::OsKind::Macos) => Some(relay_input::Os::MacOs),
+                    Ok(v1::OsKind::Windows) => Some(relay_input::Os::Windows),
+                    _ => None,
+                };
+                shared.host.lock().expect("poisoned").os = os;
+                if !h.device_name.is_empty() {
+                    *shared.host_name.lock().expect("poisoned") = h.device_name.clone();
+                }
+            }
+            Some(v1::ControlMessage {
+                msg: Some(Msg::Permissions(p)),
+            }) => {
+                shared.host.lock().expect("poisoned").control = p.control;
+                if !p.control {
+                    tracing::info!("host allows viewing only");
+                }
+            }
+            Some(v1::ControlMessage {
                 msg: Some(Msg::Monitors(m)),
             }) => {
                 if let Some(d) = m.displays.first() {
-                    *shared.host_name.lock().expect("poisoned") =
-                        format!("{addr} · {}x{}", d.width, d.height);
+                    let mut n = shared.host_name.lock().expect("poisoned");
+                    *n = format!("{n} · {}x{}", d.width, d.height);
                 }
             }
             Some(_) => {}
@@ -210,6 +257,52 @@ async fn network(
         let _ = tx.finish();
     });
 
+    // Input: its own unidirectional stream at top priority (§6 rule 8),
+    // so it is never queued behind other stream data.
+    let input_writer = {
+        let mut s = conn.open_uni().await?;
+        let _ = s.set_priority(relay_net::channel::Channel::Input.priority());
+        s.write_all(&[relay_net::channel::Channel::Input as u8])
+            .await?;
+        tokio::spawn(async move {
+            while let Some(ev) = input_rx.recv().await {
+                if quic::send_msg(&mut s, &ev).await.is_err() {
+                    break;
+                }
+            }
+            let _ = s.finish();
+        })
+    };
+
+    // Streams opened by the host (cursor).
+    let streams = {
+        let conn = conn.clone();
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            while let Ok(mut rx) = conn.accept_uni().await {
+                let mut tag = [0u8; 1];
+                if rx.read_exact(&mut tag).await.is_err() {
+                    continue;
+                }
+                if relay_net::channel::Channel::from_u8(tag[0])
+                    == Some(relay_net::channel::Channel::Cursor)
+                {
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        // 256x256 RGBA plus headers.
+                        while let Ok(Some(m)) =
+                            quic::recv_msg::<v1::CursorMessage>(&mut rx, 300_000).await
+                        {
+                            if proxy.send_event(UserEvent::Cursor(m)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        })
+    };
+
     // Decoder thread.
     let (dec_tx, dec_rx) = mpsc::sync_channel::<CompleteFrame>(DECODE_QUEUE);
     let decoder = {
@@ -230,6 +323,8 @@ async fn network(
         detail: String::new(),
     })));
     drop(ctl_tx);
+    input_writer.abort();
+    streams.abort();
     let _ = tokio::time::timeout(Duration::from_millis(300), writer).await;
     conn.close(0u32.into(), b"viewer closed");
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;

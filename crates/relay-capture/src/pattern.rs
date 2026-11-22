@@ -171,7 +171,53 @@ pub fn mem_frame(w: usize, h: usize, n: u64, ms: u32) -> Arc<dyn NativeFrame> {
     Arc::new(MemFrame { w, h, y, uv })
 }
 
+/// A 12x19 arrow, so the cursor channel can be exercised without a screen.
+fn arrow() -> CursorImage {
+    const ROWS: [&str; 19] = [
+        "X...........",
+        "XX..........",
+        "X.X.........",
+        "X..X........",
+        "X...X.......",
+        "X....X......",
+        "X.....X.....",
+        "X......X....",
+        "X.......X...",
+        "X........X..",
+        "X.........X.",
+        "X......XXXXX",
+        "X...X..X....",
+        "X..XX..X....",
+        "X.X..X..X...",
+        "XX...X..X...",
+        "X.....X..X..",
+        "......X..X..",
+        ".......XX...",
+    ];
+    let mut rgba = Vec::with_capacity(12 * 19 * 4);
+    for row in ROWS {
+        for c in row.bytes() {
+            rgba.extend_from_slice(if c == b'X' {
+                &[0, 0, 0, 255]
+            } else {
+                &[255, 255, 255, 0]
+            });
+        }
+    }
+    CursorImage::new(12, 19, 0, 0, rgba, 1.0)
+}
+
 impl ScreenCapturer for PatternCapturer {
+    fn cursor(&mut self) -> Option<CursorState> {
+        let t = self.n as f32 / self.fps as f32;
+        Some(CursorState {
+            visible: true,
+            x: 0.5 + 0.3 * t.cos(),
+            y: 0.5 + 0.3 * t.sin(),
+            image: Some(Arc::new(arrow())),
+        })
+    }
+
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
         Ok(vec![DisplayInfo {
             id: 1,

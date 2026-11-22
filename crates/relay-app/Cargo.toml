@@ -19,6 +19,7 @@ relay-net.workspace = true
 relay-capture.workspace = true
 relay-codec.workspace = true
 relay-session.workspace = true
+relay-input = { path = "../relay-input" }
 latency-bench = { path = "../../tools/latency-bench" }
 anyhow.workspace = true
 bytes.workspace = true

@@ -12,13 +12,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use relay_codec::{DecodedFrame, DecodedImage};
+use relay_input::keymap::ModifierMapper;
+use relay_input::{InputEvent, Modifiers, MouseButton, Os};
+use relay_proto::v1;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use super::{Shared, UserEvent};
+use super::{Shared, UserEvent, ViewOptions, keys};
 
 const SHADER: &str = r#"
 struct Uniforms { scale: vec2<f32>, _pad: vec2<f32> };
@@ -88,6 +91,120 @@ pub struct App {
     meter: Option<Meter>,
     last_log: Instant,
     presented: u32,
+    input: InputState,
+    cursor: RemoteCursor,
+}
+
+/// The Host's pointer, shown as the local OS cursor (§6 rule 5): the
+/// pointer moves at local input rate while its shape follows the Host.
+#[derive(Default)]
+struct RemoteCursor {
+    shapes: std::collections::HashMap<u64, v1::CursorShape>,
+    built: std::collections::HashMap<(u64, u32), winit::window::CustomCursor>,
+    hash: u64,
+    visible: bool,
+    applied: Option<(u64, u32, bool)>,
+}
+
+/// Controller-side input capture (FR-13 to FR-16).
+struct InputState {
+    tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
+    swap_cmd_ctrl: bool,
+    translate_chars: bool,
+    mapper: Option<ModifierMapper>,
+    /// Keys and buttons held, released if the window loses focus.
+    keys_down: Vec<u16>,
+    buttons_down: Vec<MouseButton>,
+    mods: ModifiersState,
+    last_pos: Option<(f32, f32)>,
+}
+
+const LOCAL_OS: Os = if cfg!(target_os = "macos") {
+    Os::MacOs
+} else {
+    Os::Windows
+};
+
+impl InputState {
+    fn send(&self, ev: InputEvent) {
+        let _ = self
+            .tx
+            .send(crate::input_wire::to_proto(&ev, crate::clock::now_us()));
+    }
+
+    fn mapper(&mut self, host_os: Option<Os>) -> ModifierMapper {
+        *self.mapper.get_or_insert_with(|| {
+            ModifierMapper::new(LOCAL_OS, host_os.unwrap_or(LOCAL_OS), self.swap_cmd_ctrl)
+        })
+    }
+
+    fn modifiers(&self) -> Modifiers {
+        let m = self.mods;
+        let mut bits = 0;
+        if m.shift_key() {
+            bits |= Modifiers::SHIFT;
+        }
+        if m.control_key() {
+            bits |= Modifiers::CTRL;
+        }
+        if m.alt_key() {
+            bits |= Modifiers::ALT;
+        }
+        if m.super_key() {
+            bits |= Modifiers::META;
+        }
+        Modifiers(bits)
+    }
+
+    /// Release everything we pressed (focus loss, window close).
+    fn release_all(&mut self) {
+        for u in std::mem::take(&mut self.keys_down) {
+            self.send(InputEvent::Key {
+                usage: u,
+                down: false,
+                modifiers: Modifiers::default(),
+            });
+        }
+        for b in std::mem::take(&mut self.buttons_down) {
+            self.send(InputEvent::MouseButton {
+                button: b,
+                down: false,
+            });
+        }
+    }
+}
+
+/// Nearest-neighbour resample of a Host cursor by `k`.
+fn scale_cursor(s: &v1::CursorShape, k: f32) -> Option<winit::window::CustomCursorSource> {
+    let (w, h) = (s.width as usize, s.height as usize);
+    if w == 0 || h == 0 || s.rgba.len() < w * h * 4 {
+        return None;
+    }
+    let tw = ((w as f32 * k).round() as usize).clamp(1, 256);
+    let th = ((h as f32 * k).round() as usize).clamp(1, 256);
+    let mut out = vec![0u8; tw * th * 4];
+    for y in 0..th {
+        let sy = (y * h / th).min(h - 1);
+        for x in 0..tw {
+            let sx = (x * w / tw).min(w - 1);
+            out[(y * tw + x) * 4..][..4].copy_from_slice(&s.rgba[(sy * w + sx) * 4..][..4]);
+        }
+    }
+    let hx = ((s.hotspot_x as f32 * k).round() as usize).min(tw - 1);
+    let hy = ((s.hotspot_y as f32 * k).round() as usize).min(th - 1);
+    winit::window::CustomCursor::from_rgba(out, tw as u16, th as u16, hx as u16, hy as u16).ok()
+}
+
+fn map_button(b: winit::event::MouseButton) -> Option<MouseButton> {
+    use winit::event::MouseButton as W;
+    Some(match b {
+        W::Left => MouseButton::Left,
+        W::Right => MouseButton::Right,
+        W::Middle => MouseButton::Middle,
+        W::Back => MouseButton::Back,
+        W::Forward => MouseButton::Forward,
+        W::Other(_) => return None,
+    })
 }
 
 /// Glass-to-glass samples from the test-pattern timestamp stripe.
@@ -135,9 +252,25 @@ impl Meter {
 }
 
 impl App {
-    pub fn new(shared: Arc<Shared>, quit: tokio::sync::oneshot::Sender<()>, measure: bool) -> Self {
+    pub fn new(
+        shared: Arc<Shared>,
+        quit: tokio::sync::oneshot::Sender<()>,
+        input_tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
+        opts: &ViewOptions,
+    ) -> Self {
         Self {
-            meter: measure.then(|| Meter {
+            input: InputState {
+                tx: input_tx,
+                swap_cmd_ctrl: opts.cmd_ctrl_swap,
+                translate_chars: opts.translate_chars,
+                mapper: None,
+                keys_down: Vec::new(),
+                buttons_down: Vec::new(),
+                mods: ModifiersState::empty(),
+                last_pos: None,
+            },
+            cursor: RemoteCursor::default(),
+            meter: opts.measure.then(|| Meter {
                 samples: Vec::new(),
             }),
             last_log: Instant::now(),
@@ -171,7 +304,137 @@ impl App {
         self.last_title = Instant::now();
     }
 
+    fn control_allowed(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.planes.is_some())
+            && self.shared.host.lock().expect("poisoned").control
+    }
+
+    /// Window pixel → normalised Host display coordinate (FR-16), using the
+    /// same letterbox placement as the renderer.
+    fn normalise(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let g = self.gpu.as_ref()?;
+        let p = g.planes.as_ref()?;
+        let vp = relay_input::mapping::Viewport {
+            view_w: g.config.width as f32,
+            view_h: g.config.height as f32,
+            frame_w: p.w as f32,
+            frame_h: p.h as f32,
+            mode: relay_input::mapping::ViewMode::Fit,
+        };
+        // winit positions are already physical pixels.
+        Some(vp.to_normalised(x as f32, y as f32, 1.0))
+    }
+
+    fn on_key(&mut self, ev: &KeyEvent) {
+        let PhysicalKey::Code(code) = ev.physical_key else {
+            return;
+        };
+        let down = ev.state == ElementState::Pressed;
+        let host_os = self.shared.host.lock().expect("poisoned").os;
+        let st = &mut self.input;
+        let m = st.modifiers();
+        // "Translate characters" mode: printable text without shortcut
+        // modifiers is sent as characters (FR-14).
+        if st.translate_chars
+            && down
+            && !m.contains(Modifiers::CTRL)
+            && !m.contains(Modifiers::META)
+            && let Some(t) = ev
+                .text
+                .as_ref()
+                .filter(|t| t.chars().all(|c| !c.is_control()))
+        {
+            st.send(InputEvent::Text(t.to_string()));
+            return;
+        }
+        let Some(usage) = keys::hid_usage(code) else {
+            return;
+        };
+        if ev.repeat && !down {
+            return;
+        }
+        if down {
+            if !st.keys_down.contains(&usage) {
+                st.keys_down.push(usage);
+            }
+        } else if let Some(i) = st.keys_down.iter().position(|&u| u == usage) {
+            st.keys_down.remove(i);
+        } else if !st.translate_chars {
+            return; // key-up for a key pressed before we had focus
+        }
+        let mapped = st.mapper(host_os).apply(InputEvent::Key {
+            usage,
+            down,
+            modifiers: m,
+        });
+        st.send(mapped);
+    }
+
+    fn on_cursor(&mut self, el: &ActiveEventLoop, m: v1::CursorMessage) {
+        match m.msg {
+            Some(v1::cursor_message::Msg::Shape(s)) => {
+                if !s.rgba.is_empty() {
+                    self.cursor.shapes.insert(s.hash, s);
+                }
+            }
+            Some(v1::cursor_message::Msg::Position(p)) => {
+                self.cursor.hash = p.shape_hash;
+                self.cursor.visible = p.visible;
+            }
+            None => {}
+        }
+        self.apply_cursor(el);
+    }
+
+    fn apply_cursor(&mut self, el: &ActiveEventLoop) {
+        let Some(g) = &self.gpu else { return };
+        let Some(p) = &g.planes else { return };
+        // Size the Host cursor like the video: host px × fit scale, in
+        // the units winit expects (points on macOS, pixels elsewhere).
+        let fit = (g.config.width as f32 / p.w as f32).min(g.config.height as f32 / p.h as f32);
+        let units = if cfg!(target_os = "macos") {
+            fit / g.window.scale_factor() as f32
+        } else {
+            fit
+        };
+        let key_scale = (units * 100.0).round() as u32;
+        let c = &mut self.cursor;
+        let want = (c.hash, key_scale, c.visible);
+        if c.applied == Some(want) {
+            return;
+        }
+        if !c.visible {
+            g.window.set_cursor_visible(false);
+            c.applied = Some(want);
+            return;
+        }
+        let Some(shape) = c.shapes.get(&c.hash) else {
+            return; // shape not received yet; keep the current one
+        };
+        let cursor = match c.built.get(&(c.hash, key_scale)) {
+            Some(cc) => cc.clone(),
+            None => {
+                let Some(src) = scale_cursor(shape, units) else {
+                    return;
+                };
+                let cc = el.create_custom_cursor(src);
+                tracing::info!(
+                    "cursor: host shape {}x{} (hash {:x}) at {units:.2}x",
+                    shape.width,
+                    shape.height,
+                    shape.hash
+                );
+                c.built.insert((c.hash, key_scale), cc.clone());
+                cc
+            }
+        };
+        g.window.set_cursor(cursor);
+        g.window.set_cursor_visible(true);
+        c.applied = Some(want);
+    }
+
     fn end(&mut self, el: &ActiveEventLoop) {
+        self.input.release_all();
         if let Some(q) = self.quit.take() {
             let _ = q.send(());
         }
@@ -507,9 +770,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // Newest decoded frame only; older ones were superseded.
                 if let Some(f) = self.shared.frames.try_recv() {
                     let _s = tracing::trace_span!("present").entered();
+                    let first = gpu.planes.is_none();
                     gpu.upload(&f);
                     gpu.draw();
                     self.presented += 1;
+                    if first {
+                        self.cursor.applied = None;
+                        self.apply_cursor(el);
+                    }
                     if let Some(m) = &mut self.meter {
                         m.sample(&f);
                     }
@@ -534,6 +802,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_title();
                 }
             }
+            UserEvent::Cursor(m) => self.on_cursor(el, m),
             UserEvent::Status(s) => {
                 self.status = s;
                 self.update_title();
@@ -548,38 +817,72 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         match ev {
             WindowEvent::CloseRequested => self.end(el),
+            WindowEvent::ModifiersChanged(m) => self.input.mods = m.state(),
+            WindowEvent::Focused(false) => self.input.release_all(),
             WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
+                event,
+                is_synthetic,
                 ..
             } => {
-                // M1 has no remote input; Esc leaves full screen or closes.
-                if let Some(g) = &self.gpu
-                    && g.window.fullscreen().is_some()
+                // Local shortcut, never sent: Ctrl+Alt+Enter toggles full screen.
+                let m = self.input.mods;
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
+                    && m.control_key()
+                    && m.alt_key()
                 {
-                    g.window.set_fullscreen(None);
-                } else {
-                    self.end(el);
+                    if let Some(g) = &self.gpu {
+                        let fs = g.window.fullscreen().is_some();
+                        g.window.set_fullscreen(
+                            (!fs).then_some(winit::window::Fullscreen::Borderless(None)),
+                        );
+                    }
+                    return;
+                }
+                if !is_synthetic && self.control_allowed() {
+                    self.on_key(&event);
                 }
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Character(c),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } if c.as_str() == "f" => {
-                if let Some(g) = &self.gpu {
-                    let fs = g.window.fullscreen().is_some();
-                    g.window.set_fullscreen(
-                        (!fs).then_some(winit::window::Fullscreen::Borderless(None)),
-                    );
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.control_allowed()
+                    && let Some((x, y)) = self.normalise(position.x, position.y)
+                    && self.input.last_pos != Some((x, y))
+                {
+                    self.input.last_pos = Some((x, y));
+                    self.input.send(InputEvent::MouseMove { x, y });
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(b) = map_button(button)
+                    && self.control_allowed()
+                {
+                    let down = state == ElementState::Pressed;
+                    let st = &mut self.input;
+                    st.buttons_down.retain(|x| *x != b);
+                    if down {
+                        st.buttons_down.push(b);
+                    }
+                    st.send(InputEvent::MouseButton { button: b, down });
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.control_allowed() {
+                    let ev = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => InputEvent::Scroll {
+                            dx: x * relay_input::PX_PER_WHEEL_NOTCH,
+                            dy: y * relay_input::PX_PER_WHEEL_NOTCH,
+                            precise: false,
+                        },
+                        MouseScrollDelta::PixelDelta(p) => {
+                            let scale = self.gpu.as_ref().map_or(1.0, |g| g.window.scale_factor());
+                            InputEvent::Scroll {
+                                dx: (p.x / scale) as f32,
+                                dy: (p.y / scale) as f32,
+                                precise: true,
+                            }
+                        }
+                    };
+                    self.input.send(ev);
                 }
             }
             WindowEvent::Resized(s) => {
@@ -587,6 +890,7 @@ impl ApplicationHandler<UserEvent> for App {
                     g.resize(s.width, s.height);
                     g.draw();
                 }
+                self.apply_cursor(el);
             }
             WindowEvent::RedrawRequested => {
                 if let Some(g) = &mut self.gpu {

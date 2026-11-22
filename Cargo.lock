@@ -2236,6 +2236,7 @@ dependencies = [
  "relay-capture",
  "relay-codec",
  "relay-crypto",
+ "relay-input",
  "relay-net",
  "relay-proto",
  "relay-session",
@@ -2252,6 +2253,7 @@ name = "relay-capture"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "objc2 0.6.5",
  "screencapturekit",
  "thiserror 2.0.21",
  "windows",
@@ -2284,6 +2286,7 @@ name = "relay-input"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]

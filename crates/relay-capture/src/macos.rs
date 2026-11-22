@@ -33,6 +33,7 @@ unsafe extern "C" {
     fn CGDisplayModeGetPixelHeight(mode: *mut CgDisplayModeOpaque) -> usize;
     fn CGDisplayModeRelease(mode: *mut CgDisplayModeOpaque);
     fn CGMainDisplayID() -> u32;
+    fn CGCursorIsVisible() -> u8;
 }
 
 /// Physical pixel size of a display, if CoreGraphics knows it.
@@ -198,6 +199,10 @@ pub struct SckCapturer {
     stream: Option<SCStream>,
     shared: Arc<Shared>,
     fps: u32,
+    /// Selected display bounds in global points, for cursor mapping.
+    bounds: (f64, f64, f64, f64),
+    cursor_img: Option<Arc<crate::CursorImage>>,
+    cursor_polled: Option<Instant>,
 }
 
 impl std::fmt::Debug for SckCapturer {
@@ -223,6 +228,9 @@ impl SckCapturer {
                 cv: Condvar::new(),
             }),
             fps: 60,
+            bounds: (0.0, 0.0, 1.0, 1.0),
+            cursor_img: None,
+            cursor_polled: None,
         }
     }
 
@@ -249,6 +257,33 @@ impl Drop for SckCapturer {
 }
 
 impl ScreenCapturer for SckCapturer {
+    fn cursor(&mut self) -> Option<crate::CursorState> {
+        // The image is comparatively costly to read; poll it at ~20 Hz.
+        if self
+            .cursor_polled
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(50))
+        {
+            self.cursor_polled = Some(Instant::now());
+            if let Some(img) = crate::macos_cursor::current_image()
+                && self.cursor_img.as_ref().is_none_or(|c| c.hash != img.hash)
+            {
+                self.cursor_img = Some(img);
+            }
+        }
+        let (px, py) = crate::macos_cursor::location();
+        let (x0, y0, w, h) = self.bounds;
+        let (x, y) = (((px - x0) / w) as f32, ((py - y0) / h) as f32);
+        let inside = (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
+        // SAFETY: plain CoreGraphics getter.
+        let shown = unsafe { CGCursorIsVisible() } != 0;
+        Some(crate::CursorState {
+            visible: shown && inside,
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+            image: self.cursor_img.clone(),
+        })
+    }
+
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
         // SAFETY: plain CoreGraphics getter.
         let main = unsafe { CGMainDisplayID() };
@@ -277,6 +312,13 @@ impl ScreenCapturer for SckCapturer {
     fn select(&mut self, display_id: u32) -> Result<(), CaptureError> {
         self.stop();
         let display = self.find(display_id)?;
+        let f = display.frame();
+        self.bounds = (
+            f.origin.x,
+            f.origin.y,
+            f.size.width.max(1.0),
+            f.size.height.max(1.0),
+        );
         let (w, h) = pixel_size(display_id).unwrap_or((display.width(), display.height()));
         // H.264 needs even dimensions.
         let (w, h) = (w & !1, h & !1);
@@ -290,9 +332,9 @@ impl ScreenCapturer for SckCapturer {
             .with_width(w)
             .with_height(h)
             .with_pixel_format(screencapturekit::stream::configuration::PixelFormat::YCbCr_420v)
-            // M1 bakes the cursor into the video. M2 turns this off and
-            // draws it locally from the cursor channel (§6 rule 5).
-            .with_shows_cursor(true)
+            // The cursor travels on its own channel and the Controller
+            // draws it locally (§6 rule 5).
+            .with_shows_cursor(false)
             .with_minimum_frame_interval(&CMTime::new(1, self.fps as i32))
             .with_queue_depth(3)
             // The viewer's shader assumes BT.709 limited range.

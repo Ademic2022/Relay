@@ -220,14 +220,23 @@ message CursorShape {
   uint32 height = 3;
   uint32 hotspot_x = 4;
   uint32 hotspot_y = 5;
-  bytes rgba = 6;               // empty if the peer already cached `hash`
+  bytes rgba = 6;               // straight-alpha RGBA; empty if the peer already cached `hash`
+  uint32 scale_milli = 7;       // image pixels per Host point, x1000
 }
 
 message CursorPosition {
-  float x = 1;
+  float x = 1;                  // normalised 0..1 within the selected display
   float y = 2;
   bool visible = 3;
   uint64 shape_hash = 4;
+}
+
+// Everything on the cursor stream (§8.1).
+message CursorMessage {
+  oneof msg {
+    CursorShape shape = 1;
+    CursorPosition position = 2;
+  }
 }
 
 // ---------------------------------------------------------------- clipboard & chat

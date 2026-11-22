@@ -12,7 +12,8 @@ Built milestone by milestone (PRD §12).
 |---|---|
 | M0 Skeleton: workspace, traits, protobuf, CI | done |
 | M1 LAN screen view | macOS host + viewer working; Windows capture (DXGI) + encoder (Media Foundation) written, never run; acceptance not yet run on two machines |
-| M2–M8 | not started |
+| M2 Remote control | mouse, keyboard (HID scancodes), scroll, ⌘/Ctrl mapping, HiDPI mapping, cursor channel written; not yet tried by hand |
+| M3–M8 | not started |
 
 ## Layout
 
@@ -23,7 +24,7 @@ Built milestone by milestone (PRD §12).
 | `relay-net` | QUIC endpoints (quinn, BBR, small datagram buffer), channel map, video datagram framing, newest-wins reassembly |
 | `relay-capture` | `ScreenCapturer` trait; ScreenCaptureKit (macOS); DXGI Desktop Duplication + GPU NV12 conversion (Windows); test pattern |
 | `relay-codec` | `Encoder` / `Decoder` traits; VideoToolbox (macOS) and Media Foundation (Windows) hardware encoders; openh264 software encoder/decoder |
-| `relay-input` | input model (USB HID usages), ⌘/Ctrl mapping, HiDPI coordinate mapping, `InputInjector` trait |
+| `relay-input` | input model (USB HID usages + macOS/Windows key tables), ⌘/Ctrl mapping, HiDPI mapping; CGEvent (macOS) and SendInput (Windows) injectors |
 | `relay-session` | newest-wins channel, ABR controller, IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
 | `relay-render` | viewer present-mode policy (wgpu viewer in M1) |
 | `relay-service` | unattended-access agent targets (service in M7) |
@@ -44,9 +45,14 @@ cargo build --release -p relay-app
 ./target/release/relay view <ip> --code <code>
 ```
 
+The viewer forwards mouse, keyboard and scroll to the host (`relay host --view-only` disables
+that). On macOS the host needs Accessibility permission for remote control; it asks once.
+`Ctrl+Alt+Enter` toggles full screen in the viewer. `--no-cmd-ctrl-swap` keeps ⌘ and Ctrl as-is
+between Mac and Windows; `--translate-chars` sends typed characters for mismatched layouts.
+OS-reserved shortcuts (⌘Tab, Ctrl+Alt+Del) are not captured yet.
+
 Windows works the same way (`target\release\relay.exe`). Allow `relay.exe` through Windows
-Firewall for UDP 21118. The Windows host does not show the mouse pointer yet: DXGI leaves it
-out of the image, and the cursor channel arrives in M2.
+Firewall for UDP 21118.
 
 Without Screen Recording permission, `relay host --test-pattern 1920x1080` streams a synthetic
 pattern. `relay view ... --measure` reads the pattern's timestamp stripe and logs latency

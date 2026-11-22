@@ -430,6 +430,8 @@ pub struct DxgiCapturer {
     selected: Option<u32>,
     session: Option<Session>,
     dirty_buf: Vec<RECT>,
+    cursor: Option<CursorState>,
+    shape_buf: Vec<u8>,
 }
 
 // SAFETY: used from one thread at a time (&mut self); COM objects here are
@@ -456,6 +458,8 @@ impl DxgiCapturer {
             selected: None,
             session: None,
             dirty_buf: Vec::new(),
+            cursor: None,
+            shape_buf: Vec::new(),
         })
     }
 
@@ -506,7 +510,68 @@ impl DxgiCapturer {
     }
 }
 
+/// DXGI pointer shape → straight-alpha RGBA.
+fn pointer_to_rgba(buf: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Option<CursorImage> {
+    let (w, pitch) = (si.Width as usize, si.Pitch as usize);
+    let ty = si.Type as i32;
+    let h = if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+        si.Height as usize / 2
+    } else {
+        si.Height as usize
+    };
+    if w == 0 || h == 0 || w > 256 || h > 256 {
+        return None;
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+        // AND mask then XOR mask, 1 bpp each.
+        for y in 0..h {
+            for x in 0..w {
+                let bit = 0x80 >> (x % 8);
+                let and = buf.get(y * pitch + x / 8)? & bit != 0;
+                let xor = buf.get((y + h) * pitch + x / 8)? & bit != 0;
+                let px = &mut rgba[(y * w + x) * 4..][..4];
+                match (and, xor) {
+                    (true, false) => {}                                    // transparent
+                    (false, false) => px.copy_from_slice(&[0, 0, 0, 255]), // black
+                    (false, true) => px.copy_from_slice(&[255, 255, 255, 255]),
+                    (true, true) => px.copy_from_slice(&[0, 0, 0, 255]), // invert ≈ black
+                }
+            }
+        }
+    } else {
+        let masked = ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0;
+        for y in 0..h {
+            for x in 0..w {
+                let src = buf.get(y * pitch + x * 4..y * pitch + x * 4 + 4)?;
+                let (b, g, r, a) = (src[0], src[1], src[2], src[3]);
+                let px = &mut rgba[(y * w + x) * 4..][..4];
+                let alpha = if masked {
+                    // Mask 0 = opaque colour; 0xFF = XOR with screen (drawn
+                    // as the colour unless it is black, i.e. no-op).
+                    if a == 0 || (r | g | b) != 0 { 255 } else { 0 }
+                } else {
+                    a
+                };
+                px.copy_from_slice(&[r, g, b, alpha]);
+            }
+        }
+    }
+    Some(CursorImage::new(
+        w as u32,
+        h as u32,
+        si.HotSpot.x.max(0) as u32,
+        si.HotSpot.y.max(0) as u32,
+        rgba,
+        1.0,
+    ))
+}
+
 impl ScreenCapturer for DxgiCapturer {
+    fn cursor(&mut self) -> Option<CursorState> {
+        self.cursor.clone()
+    }
+
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
         Ok(outputs()?.iter().map(display_info).collect())
     }
@@ -542,6 +607,38 @@ impl ScreenCapturer for DxgiCapturer {
                 Err(e) => return Err(plat(e)),
             }
             let captured_at = Instant::now();
+            // Pointer state rides along with every acquired frame.
+            if info.LastMouseUpdateTime != 0 {
+                let p = info.PointerPosition;
+                let mut c = self.cursor.clone().unwrap_or(CursorState {
+                    visible: false,
+                    x: 0.0,
+                    y: 0.0,
+                    image: None,
+                });
+                c.visible = p.Visible.as_bool();
+                c.x = p.Position.x as f32 / s.width.max(1) as f32;
+                c.y = p.Position.y as f32 / s.height.max(1) as f32;
+                if info.PointerShapeBufferSize > 0 {
+                    self.shape_buf
+                        .resize(info.PointerShapeBufferSize as usize, 0);
+                    let mut used = 0u32;
+                    let mut si = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                    if s.dup
+                        .GetFramePointerShape(
+                            self.shape_buf.len() as u32,
+                            self.shape_buf.as_mut_ptr().cast(),
+                            &mut used,
+                            &mut si,
+                        )
+                        .is_ok()
+                        && let Some(img) = pointer_to_rgba(&self.shape_buf[..used as usize], &si)
+                    {
+                        c.image = Some(Arc::new(img));
+                    }
+                }
+                self.cursor = Some(c);
+            }
             // Pointer-only update: no new desktop image.
             if info.LastPresentTime == 0 || info.AccumulatedFrames == 0 {
                 return Ok(None);

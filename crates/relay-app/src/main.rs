@@ -11,6 +11,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod clock;
 mod host;
+mod host_input;
+mod input_wire;
 mod rt;
 mod viewer;
 
@@ -56,6 +58,9 @@ enum Cmd {
         bitrate: u32,
         #[arg(long, default_value_t = 60)]
         fps: u32,
+        /// Let viewers watch but not control (FR-11).
+        #[arg(long)]
+        view_only: bool,
     },
     /// View a host's screen.
     View {
@@ -68,6 +73,13 @@ enum Cmd {
         /// timestamp stripe (clocks must be synced across machines).
         #[arg(long)]
         measure: bool,
+        /// Do not swap ⌘ and Ctrl between macOS and Windows (FR-15).
+        #[arg(long)]
+        no_cmd_ctrl_swap: bool,
+        /// Send typed characters instead of physical keys, for mismatched
+        /// keyboard layouts (FR-14).
+        #[arg(long)]
+        translate_chars: bool,
     },
 }
 
@@ -90,7 +102,9 @@ fn main() -> anyhow::Result<()> {
             codec,
             bitrate,
             fps,
+            view_only,
         } => host::run(host::Options {
+            view_only,
             bind,
             display,
             list_displays,
@@ -103,9 +117,17 @@ fn main() -> anyhow::Result<()> {
             addr,
             code,
             measure,
+            no_cmd_ctrl_swap,
+            translate_chars,
         } => {
             let addr = parse_addr(&addr)?;
-            viewer::run(addr, code, measure)
+            viewer::run(viewer::ViewOptions {
+                addr,
+                code,
+                measure,
+                cmd_ctrl_swap: !no_cmd_ctrl_swap,
+                translate_chars,
+            })
         }
     }
 }
