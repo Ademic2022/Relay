@@ -293,6 +293,10 @@ message FileOpRequest {
   string new_path = 3;
 }
 
+// Upload (Controller → Host): `path` is the destination folder and `name`
+// the file name; the Host joins them with its own separator.
+// Download (Host → Controller): `path` is the source file. The Host answers
+// with its own TransferStart carrying size, chunk size and hash.
 message TransferStart {
   string path = 1;
   uint64 size = 2;
@@ -300,6 +304,7 @@ message TransferStart {
   bytes file_blake3 = 4;
   uint64 resume_from_chunk = 5;
   bool upload = 6;              // true = Controller to Host
+  string name = 7;
 }
 
 message FileChunk {

@@ -36,6 +36,8 @@ pub struct Options {
     pub view_only: bool,
     /// Sync clipboard text with the Controller (FR-17).
     pub clipboard: bool,
+    /// Let the Controller browse and transfer files (FR-26).
+    pub files: bool,
     pub server: Option<crate::rdv::Server>,
 }
 
@@ -390,7 +392,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             view: true,
             control: !opts.view_only,
             clipboard: opts.clipboard && !opts.view_only,
-            file_transfer: false,
+            file_transfer: opts.files && !opts.view_only,
         })),
     )
     .await?;
@@ -429,6 +431,9 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             peer.name.clone()
         },
     ));
+    // File transfer (FR-26–28): one task per request stream.
+    let files_task = (opts.files && !opts.view_only)
+        .then(|| tokio::spawn(crate::files::accept_loop(conn.clone())));
     // Chat (FR-24): lines typed in this terminal go to the viewer.
     let chat = crate::chat::ChatLink::start(conn);
     println!("  Type a message and press Enter to chat with the viewer.");
@@ -562,6 +567,9 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     drop(prober);
     input_task.abort();
     chat_task.abort();
+    if let Some(t) = files_task {
+        t.abort();
+    }
     drop(cursor_tx);
     cursor_task.abort();
     let _ = tokio::task::spawn_blocking(move || pipeline.join()).await;

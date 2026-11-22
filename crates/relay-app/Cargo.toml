@@ -36,6 +36,7 @@ pollster = "0.4"
 font8x8 = { version = "0.3", default-features = false }
 arboard = { version = "3", default-features = false }
 jiff = "1"
+blake3.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }

@@ -20,6 +20,7 @@ use relay_proto::v1::{self, control_message::Msg};
 use relay_session::latest;
 use tokio::sync::mpsc as tmpsc;
 
+mod files_ui;
 mod keys;
 mod overlay;
 mod render;
@@ -36,6 +37,7 @@ const DECODE_QUEUE: usize = 6;
 pub enum UserEvent {
     Frame,
     Chat(v1::ChatMessage),
+    Files(files_ui::FileEvent),
     Cursor(v1::CursorMessage),
     Status(String),
     Closed(String),
@@ -71,6 +73,7 @@ pub struct HostInfo {
     pub os: Option<relay_input::Os>,
     pub control: bool,
     pub clipboard: bool,
+    pub file_transfer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,8 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
     let (ui_tx, ui_rx) = tmpsc::unbounded_channel::<v1::ControlMessage>();
     // Chat lines typed in the window.
     let (chat_tx, chat_rx) = tmpsc::unbounded_channel::<String>();
+    // File manager commands.
+    let (files_tx, files_rx) = tmpsc::unbounded_channel::<files_ui::FileCmd>();
 
     let net = {
         let proxy = proxy.clone();
@@ -139,6 +144,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
                         input_rx,
                         ui_rx,
                         chat_rx,
+                        files_rx,
                     },
                 ));
                 let msg = match res {
@@ -149,7 +155,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
             })?
     };
 
-    let mut app = render::App::new(shared, quit_tx, input_tx, ui_tx, chat_tx, &opts);
+    let mut app = render::App::new(shared, quit_tx, input_tx, ui_tx, chat_tx, files_tx, &opts);
     event_loop.run_app(&mut app)?;
     let _ = net.join();
     if let Some(msg) = app.close_reason() {
@@ -263,12 +269,96 @@ fn control(msg: Msg) -> v1::ControlMessage {
     v1::ControlMessage { msg: Some(msg) }
 }
 
+/// Run file manager commands against the host.
+async fn files_worker(
+    conn: quinn::Connection,
+    mut rx: tmpsc::UnboundedReceiver<files_ui::FileCmd>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    allowed: bool,
+) {
+    use crate::files::client;
+    use files_ui::{FileCmd, FileEvent};
+    let send = move |e: FileEvent| {
+        let _ = proxy.send_event(UserEvent::Files(e));
+    };
+    while let Some(cmd) = rx.recv().await {
+        if !allowed {
+            send(FileEvent::OpDone(Err(
+                "the host does not allow file transfer".into(),
+            )));
+            continue;
+        }
+        match cmd {
+            FileCmd::ListRemote(path) => match client::list(&conn, &path).await {
+                Ok(l) => send(FileEvent::Listing(l)),
+                Err(e) => send(FileEvent::OpDone(Err(format!("{e:#}")))),
+            },
+            FileCmd::Op { op, path, new_name } => {
+                let r = client::op(&conn, op, &path, &new_name).await;
+                send(FileEvent::OpDone(r.map_err(|e| format!("{e:#}"))));
+            }
+            FileCmd::Upload { local, remote_dir } => {
+                let name = local
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let progress = Arc::new(client::Progress::default());
+                send(FileEvent::Started {
+                    name: name.clone(),
+                    upload: true,
+                    progress: progress.clone(),
+                });
+                let (conn, send) = (conn.clone(), send.clone());
+                tokio::spawn(async move {
+                    let r = client::upload(&conn, &local, &remote_dir, progress).await;
+                    send(FileEvent::Finished {
+                        name,
+                        result: r
+                            .map(|()| {
+                                if remote_dir.is_empty() {
+                                    "host Downloads".into()
+                                } else {
+                                    remote_dir
+                                }
+                            })
+                            .map_err(|e| format!("{e:#}")),
+                    });
+                });
+            }
+            FileCmd::Download { remote, local_dir } => {
+                let name = remote
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let progress = Arc::new(client::Progress::default());
+                send(FileEvent::Started {
+                    name: name.clone(),
+                    upload: false,
+                    progress: progress.clone(),
+                });
+                let (conn, send) = (conn.clone(), send.clone());
+                tokio::spawn(async move {
+                    let r = client::download(&conn, &remote, &local_dir, progress).await;
+                    send(FileEvent::Finished {
+                        name,
+                        result: r
+                            .map(|p| p.display().to_string())
+                            .map_err(|e| format!("{e:#}")),
+                    });
+                });
+            }
+        }
+    }
+}
+
 /// What the window sends to the network side.
 struct FromWindow {
     quit: tokio::sync::oneshot::Receiver<()>,
     input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
     ui_rx: tmpsc::UnboundedReceiver<v1::ControlMessage>,
     chat_rx: tmpsc::UnboundedReceiver<String>,
+    files_rx: tmpsc::UnboundedReceiver<files_ui::FileCmd>,
 }
 
 async fn network(
@@ -288,6 +378,7 @@ async fn network(
         mut input_rx,
         mut ui_rx,
         mut chat_rx,
+        files_rx,
     }: FromWindow,
 ) -> anyhow::Result<String> {
     let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {}…", target)));
@@ -328,6 +419,7 @@ async fn network(
                     let mut h = shared.host.lock().expect("poisoned");
                     h.control = p.control;
                     h.clipboard = p.clipboard;
+                    h.file_transfer = p.file_transfer;
                 }
                 if !p.control {
                     tracing::info!("host allows viewing only");
@@ -410,6 +502,14 @@ async fn network(
             }
         })
     };
+
+    // File manager (FR-26–28).
+    let files_worker = tokio::spawn(files_worker(
+        conn.clone(),
+        files_rx,
+        proxy.clone(),
+        shared.host.lock().expect("poisoned").file_transfer,
+    ));
 
     // Streams opened by the host (cursor, clipboard, chat).
     let streams = {
@@ -512,6 +612,7 @@ async fn network(
     streams.abort();
     ui_forward.abort();
     chat_forward.abort();
+    files_worker.abort();
     let _ = tokio::time::timeout(Duration::from_millis(300), writer).await;
     conn.close(0u32.into(), b"viewer closed");
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;

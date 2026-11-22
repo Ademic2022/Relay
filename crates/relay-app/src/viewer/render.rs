@@ -21,6 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use super::files_ui::{FileCmd, FileManager};
 use super::{Shared, UserEvent, ViewOptions, keys, overlay::Overlay};
 
 const SHADER: &str = r#"
@@ -81,6 +82,7 @@ struct Gpu {
     planes: Option<Planes>,
     overlay: Overlay,
     chat_panel: Overlay,
+    files_panel: Overlay,
 }
 
 pub struct App {
@@ -98,6 +100,8 @@ pub struct App {
     ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
     quality: v1::QualityMode,
     chat: Chat,
+    files: FileManager,
+    files_tx: tokio::sync::mpsc::UnboundedSender<FileCmd>,
 }
 
 /// In-window chat (FR-24).
@@ -327,9 +331,12 @@ impl App {
         input_tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
         chat_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        files_tx: tokio::sync::mpsc::UnboundedSender<FileCmd>,
         opts: &ViewOptions,
     ) -> Self {
         Self {
+            files: FileManager::new(),
+            files_tx,
             chat: Chat {
                 tx: chat_tx,
                 log: std::collections::VecDeque::new(),
@@ -365,6 +372,18 @@ impl App {
 
     pub fn close_reason(&self) -> Option<&str> {
         self.close_reason.as_deref().filter(|s| !s.is_empty())
+    }
+
+    fn refresh_files(&mut self) {
+        let open = self.files.open;
+        let lines = self.files.lines();
+        let Some(g) = &mut self.gpu else { return };
+        g.files_panel.visible = open;
+        if open {
+            let scale = g.window.scale_factor().round().max(1.0) as usize;
+            g.files_panel.set_text(&g.device, &g.queue, &lines, scale);
+        }
+        g.draw();
     }
 
     fn refresh_chat(&mut self) {
@@ -485,7 +504,7 @@ impl App {
             ),
             format!("decode {:.1} ms  mode {:?}", s.decode_ms, self.quality),
             label,
-            "Ctrl+Alt+ S stats  Q quality  M/1-9 monitor  C chat".to_string(),
+            "Ctrl+Alt+ S stats  Q quality  M/1-9 monitor  C chat  F files".to_string(),
         ];
         let scale = g.window.scale_factor().round().max(1.0) as usize;
         g.overlay.set_text(&g.device, &g.queue, &lines, scale);
@@ -508,6 +527,10 @@ impl App {
             )
         } else {
             format!("Relay — {host} — {}", self.status)
+        };
+        let title = match self.files.summary() {
+            Some(t) => format!("{t} · {title}"),
+            None => title,
         };
         let title = if self.chat.unread > 0 {
             format!("✉ {} (Ctrl+Alt+C) · {title}", self.chat.unread)
@@ -778,6 +801,7 @@ impl Gpu {
         let overlay = Overlay::new(&device, format);
         let mut chat_panel = Overlay::new(&device, format);
         chat_panel.bottom = true;
+        let files_panel = Overlay::new(&device, format);
         Ok(Self {
             window,
             surface,
@@ -791,6 +815,7 @@ impl Gpu {
             planes: None,
             overlay,
             chat_panel,
+            files_panel,
         })
     }
 
@@ -1025,9 +1050,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.last_title.elapsed().as_millis() >= 500 {
                     self.update_title();
+                    if self.files.open && self.files.has_running() {
+                        self.refresh_files();
+                    }
                 }
             }
             UserEvent::Cursor(m) => self.on_cursor(el, m),
+            UserEvent::Files(e) => {
+                self.files.on_event(e);
+                self.refresh_files();
+                self.update_title();
+            }
             UserEvent::Chat(m) => {
                 tracing::info!("chat from host: {}", m.text);
                 self.chat.push(m.sent_at_ms, false, m.text);
@@ -1052,6 +1085,15 @@ impl ApplicationHandler<UserEvent> for App {
         match ev {
             WindowEvent::CloseRequested => self.end(el),
             WindowEvent::ModifiersChanged(m) => self.input.mods = m.state(),
+            // FR-27: drop files on the window to upload them to the host's
+            // current folder (its Downloads until one is opened).
+            WindowEvent::DroppedFile(path) => {
+                tracing::info!("uploading dropped file {}", path.display());
+                let _ = self.files_tx.send(FileCmd::Upload {
+                    local: path,
+                    remote_dir: self.files.remote_dir(),
+                });
+            }
             WindowEvent::Focused(false) => self.input.release_all(),
             WindowEvent::KeyboardInput {
                 event,
@@ -1087,6 +1129,17 @@ impl ApplicationHandler<UserEvent> for App {
                             | KeyCode::Digit9),
                         ) => {
                             self.pick_monitor(code);
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyF) => {
+                            self.files.open = !self.files.open;
+                            if self.files.open {
+                                self.input.release_all();
+                                if self.files.remote_dir().is_empty() {
+                                    let _ = self.files_tx.send(FileCmd::ListRemote(String::new()));
+                                }
+                            }
+                            self.refresh_files();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
@@ -1131,6 +1184,13 @@ impl ApplicationHandler<UserEvent> for App {
                             (!fs).then_some(winit::window::Fullscreen::Borderless(None)),
                         );
                     }
+                    return;
+                }
+                if self.files.open {
+                    for cmd in self.files.key(&event) {
+                        let _ = self.files_tx.send(cmd);
+                    }
+                    self.refresh_files();
                     return;
                 }
                 if self.chat.compose.is_some() {

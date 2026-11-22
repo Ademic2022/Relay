@@ -21,6 +21,7 @@ mod clipboard;
 mod clock;
 mod consent;
 mod feedback;
+mod files;
 mod host;
 mod host_input;
 mod identity;
@@ -145,6 +146,9 @@ enum Cmd {
         /// Do not sync the clipboard with the viewer (FR-17).
         #[arg(long)]
         no_clipboard: bool,
+        /// Do not let the viewer browse or transfer files (FR-26).
+        #[arg(long)]
+        no_files: bool,
     },
     /// Connect to a host by its 9-digit ID.
     Connect {
@@ -194,8 +198,10 @@ fn main() -> anyhow::Result<()> {
             fps,
             view_only,
             no_clipboard,
+            no_files,
         } => host::run(host::Options {
             clipboard: !no_clipboard,
+            files: !no_files,
             bind,
             server: server.resolve()?,
             view_only,

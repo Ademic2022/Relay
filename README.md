@@ -16,7 +16,8 @@ Built milestone by milestone (PRD §12).
 | M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
 | M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
 | M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
-| M6–M8 | not started |
+| M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders not yet |
+| M7–M8 | not started |
 
 ## Layout
 
@@ -83,6 +84,12 @@ Viewer keys (never sent to the host):
 | `Ctrl+Alt+Q` | cycle quality mode (Speed / Balanced / Quality; `--quality` sets the start) |
 | `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor |
 | `Ctrl+Alt+C` | chat panel (typing goes to the chat while open; Enter sends, Esc closes) |
+| `Ctrl+Alt+F` | file manager: this computer ↔ host (Tab, Enter, Backspace, F5 copy, F7 mkdir, F2 rename, F8 delete, F9 cancel, Esc) |
+
+Drop files on the viewer window to upload them to the host folder open in the file manager
+(the host user's Downloads until one is opened). Transfers resume after a dropped connection
+and are BLAKE3-verified; name clashes get " (1)", " (2)"… `relay host --no-files` turns file
+access off (it is always off with `--view-only`).
 
 On the host, chat messages appear in the terminal; type a line and press Enter to reply.
 Clipboard text syncs both ways (copies made after connecting only); `--no-clipboard` on
@@ -99,6 +106,9 @@ through an emulated link and prints what happened:
 
 - 2% loss, 50 ms RTT: no freeze over 300 ms (measured ~70 ms), latency p95 ~45 ms.
 - 1 Mbit/s bottleneck: settles at ~0.8 Mbit/s, half resolution, 20+ fps, latency p95 under 100 ms.
+
+The 5 GB acceptance test (about 10 GB of temporary disk):
+`RELAY_BIG_TEST=1 cargo test --release -p relay-app five_gb -- --ignored --nocapture`
 
 ## Build and test
 
