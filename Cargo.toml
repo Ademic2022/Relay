@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Ademic2022/Relay"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
@@ -15,6 +15,8 @@ relay-proto = { path = "crates/relay-proto" }
 relay-net = { path = "crates/relay-net" }
 relay-capture = { path = "crates/relay-capture" }
 relay-codec = { path = "crates/relay-codec" }
+relay-crypto = { path = "crates/relay-crypto" }
+relay-session = { path = "crates/relay-session" }
 
 prost = "0.14"
 prost-build = "0.14"
@@ -24,6 +26,14 @@ blake3 = "1.8"
 getrandom = "0.4"
 thiserror = "2"
 bytes = "1.12"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+openh264 = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

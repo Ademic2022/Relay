@@ -1,0 +1,4 @@
+[env]
+# PRD §9: macOS 13 Ventura minimum. Also matches the Swift bridge objects
+# built by screencapturekit, avoiding "built for newer macOS" link warnings.
+MACOSX_DEPLOYMENT_TARGET = "13.0"

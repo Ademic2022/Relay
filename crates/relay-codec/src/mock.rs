@@ -67,7 +67,7 @@ impl Decoder for MockDecoder {
         Ok(Some(DecodedFrame {
             width: u32::from_le_bytes(hdr[..4].try_into().expect("4")),
             height: u32::from_le_bytes(hdr[4..].try_into().expect("4")),
-            gpu_handle: None,
+            image: DecodedImage::None,
             capture_ts_us,
         }))
     }

@@ -8,6 +8,9 @@ use bytes::Bytes;
 use relay_capture::CapturedFrame;
 
 pub mod mock;
+pub mod openh264;
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
@@ -104,13 +107,26 @@ pub trait Encoder: Send {
     fn set_bitrate(&mut self, kbps: u32) -> Result<(), CodecError>;
 }
 
-/// A decoded frame. Real decoders return a GPU texture handle that the
-/// renderer samples directly (zero-copy to present).
+/// Decoded pixels handed to the renderer.
+#[derive(Debug, Clone)]
+pub enum DecodedImage {
+    /// Planar 4:2:0 in system memory (software decoder).
+    I420 {
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        y_stride: usize,
+        uv_stride: usize,
+    },
+    /// Mock decoders produce no pixels.
+    None,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    pub gpu_handle: Option<u64>,
+    pub image: DecodedImage,
     pub capture_ts_us: u64,
 }
 

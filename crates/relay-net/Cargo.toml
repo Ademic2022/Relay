@@ -11,6 +11,13 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
+prost.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -1,10 +1,13 @@
 //! Screen capture abstraction (§6 "Capture", FR-20, FR-21).
 //!
-//! Real backends keep frames on the GPU: a [`FrameData::Gpu`] frame is an
-//! opaque handle to a D3D11 texture or IOSurface that the encoder consumes
-//! without a CPU copy (§6 rule 2). [`FrameData::Cpu`] exists for the mock
-//! backend and software fallbacks only.
+//! Real backends keep frames on the GPU: a [`FrameData::Native`] frame wraps
+//! the platform surface (IOSurface-backed `CVPixelBuffer`, D3D11 texture)
+//! that a hardware encoder consumes without a CPU copy (§6 rule 2).
+//! [`FrameData::Cpu`] exists for the mock backend only.
 
+use std::any::Any;
+use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -12,6 +15,7 @@ use bytes::Bytes;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod mock;
+pub mod pattern;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -45,13 +49,32 @@ pub enum PixelFormat {
     Nv12,
 }
 
-/// Opaque GPU surface handle owned by a platform backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GpuHandle(pub u64);
+/// Borrowed NV12 planes (8-bit Y plane + interleaved CbCr at half size).
+#[derive(Debug, Clone, Copy)]
+pub struct Nv12<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub y: &'a [u8],
+    pub y_stride: usize,
+    pub uv: &'a [u8],
+    pub uv_stride: usize,
+}
+
+/// A platform frame surface. Hardware encoders downcast via [`as_any`];
+/// software fallbacks read pixels with [`with_nv12`].
+///
+/// [`as_any`]: NativeFrame::as_any
+/// [`with_nv12`]: NativeFrame::with_nv12
+pub trait NativeFrame: Send + Sync + Debug {
+    fn as_any(&self) -> &dyn Any;
+    /// CPU view of the pixels. On GPU-backed surfaces this maps the surface
+    /// for reading; only software codecs may call it.
+    fn with_nv12(&self, f: &mut dyn FnMut(Nv12<'_>)) -> Result<(), CaptureError>;
+}
 
 #[derive(Debug, Clone)]
 pub enum FrameData {
-    Gpu(GpuHandle),
+    Native(Arc<dyn NativeFrame>),
     /// Tightly packed pixels; `stride` bytes per row.
     Cpu {
         data: Bytes,
@@ -102,7 +125,7 @@ pub fn platform_capturer() -> Result<Box<dyn ScreenCapturer>, CaptureError> {
     #[cfg(target_os = "windows")]
     return windows::DxgiCapturer::new().map(|c| Box::new(c) as _);
     #[cfg(target_os = "macos")]
-    return macos::SckCapturer::new().map(|c| Box::new(c) as _);
+    return Ok(Box::new(macos::SckCapturer::new()));
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     Err(CaptureError::Unsupported)
 }

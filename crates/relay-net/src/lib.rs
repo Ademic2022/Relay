@@ -5,6 +5,7 @@
 //! in M1 and M3.
 
 pub mod channel;
+pub mod quic;
 pub mod video;
 
 /// Default rendezvous server port (UDP/QUIC).

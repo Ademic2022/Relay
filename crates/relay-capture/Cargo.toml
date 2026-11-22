@@ -12,5 +12,11 @@ publish.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "12", features = ["macos_14_0"] }
+
+[[example]]
+name = "capture_probe"
+
 [lints]
 workspace = true

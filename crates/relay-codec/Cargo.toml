@@ -12,6 +12,10 @@ publish.workspace = true
 relay-capture.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+openh264.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+screencapturekit = "12"
 
 [lints]
 workspace = true
