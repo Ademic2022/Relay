@@ -257,6 +257,7 @@ function onHost(ev) {
       $("session-who").textContent = name;
       $("session-avatar").textContent = (name.trim()[0] ?? "?").toUpperCase();
       $("session-mode").textContent = t(ev.view_only ? "session.view" : "session.control");
+      if (ev.permissions) showPerms(ev.permissions);
       $("host-status").textContent = "";
       $("chat-log").replaceChildren();
       setStatus("live", t("status.session"));
@@ -275,6 +276,9 @@ function onHost(ev) {
       hideConsent();
       renderIdle();
       $("host-status").textContent = t("session.ended", { reason: ev.reason });
+      break;
+    case "permissions":
+      showPerms(ev);
       break;
     case "chat":
       addChat(ev.from_me ? t("chat.you") : ev.name, ev.text, ev.from_me);
@@ -342,9 +346,29 @@ function hideConsent() {
 /** @type {Recent[]} */
 let devices = [];
 
+/** @type {Set<string> | null} FR-6: IDs seen online at the last check. */
+let online = null;
+let presenceBusy = false;
+
 async function loadRecent() {
   devices = await invoke("recent");
   renderDevices();
+  refreshPresence();
+}
+
+/** Ask which saved IDs are online (LAN + server); quietly gives up. */
+async function refreshPresence() {
+  const ids = devices.map((d) => d.target).filter((x) => /^\d{9}$/.test(x));
+  if (presenceBusy || ids.length === 0) return;
+  presenceBusy = true;
+  try {
+    online = new Set(/** @type {string[]} */ (await invoke("presence", { ids })));
+    renderDevices();
+  } catch {
+    // Unknown status is shown as no dot.
+  } finally {
+    presenceBusy = false;
+  }
 }
 
 function renderDevices() {
@@ -362,6 +386,13 @@ function renderDevices() {
       const pick = el("button", "pick");
       const av = el("span", "avatar");
       av.append(icon(isId ? "monitor" : "lan"));
+      if (isId && online) {
+        const up = online.has(x.target);
+        const dot = el("span", up ? "presence on" : "presence off");
+        dot.title = t(up ? "devices.online" : "devices.offline");
+        dot.setAttribute("aria-label", dot.title);
+        av.append(dot);
+      }
       const txt = el("span", "grow");
       const title = el("div", "t");
       if (x.name) {
@@ -418,6 +449,13 @@ function renderHomeRecent() {
       const pick = el("button", "pick");
       const av = el("span", "avatar");
       av.append(icon(isId ? "monitor" : "lan"));
+      if (isId && online) {
+        const up = online.has(x.target);
+        const dot = el("span", up ? "presence on" : "presence off");
+        dot.title = t(up ? "devices.online" : "devices.offline");
+        dot.setAttribute("aria-label", dot.title);
+        av.append(dot);
+      }
       const txt = el("span", "grow");
       txt.append(el("div", x.name ? "t" : "t mono", x.name || shownTarget));
       txt.append(el("div", "when", `${x.name ? shownTarget + " · " : ""}${ago(x.last_used)}`));
@@ -554,6 +592,27 @@ function setupConnect() {
 }
 
 /** @param {ViewerEvent} ev */
+/** FR-11: reflect the session's permissions in the switches. */
+function showPerms(/** @type {any} */ p) {
+  for (const [key, id] of [["control", "perm-control"], ["clipboard", "perm-clipboard"], ["files", "perm-files"]]) {
+    const box = /** @type {HTMLInputElement} */ ($(id));
+    box.checked = !!p[key];
+    box.disabled = !p["can_" + key];
+  }
+  $("session-mode").textContent = t(p.control ? "session.control" : "session.view");
+}
+
+function setupPerms() {
+  for (const id of ["perm-control", "perm-clipboard", "perm-files"]) {
+    $(id).addEventListener("change", () => {
+      const v = (/** @type {string} */ i) => /** @type {HTMLInputElement} */ ($(i)).checked;
+      invoke("host_cmd", {
+        cmd: { cmd: "permissions", control: v("perm-control"), clipboard: v("perm-clipboard"), files: v("perm-files") },
+      });
+    });
+  }
+}
+
 /** @type {number | null} PID of the viewer waiting for a code. */
 let codePid = null;
 
@@ -704,6 +763,11 @@ async function main() {
   setupTabs();
   setupConnect();
   setupCode();
+  setupPerms();
+  // FR-6: keep the online dots current while the window is open.
+  window.setInterval(() => {
+    if (!document.hidden) refreshPresence();
+  }, 30_000);
   setupDevices();
   setupSeg();
   setupSettings();

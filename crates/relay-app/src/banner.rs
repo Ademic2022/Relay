@@ -24,6 +24,8 @@ use winit::window::{Window, WindowId, WindowLevel};
 pub enum BannerEvent {
     Show(String),
     Hide,
+    /// FR-18: black out the Host's monitors (`Some(who)`) or lift it.
+    Blackout(Option<String>, std::sync::mpsc::Sender<Result<(), String>>),
     Exit,
 }
 
@@ -56,6 +58,96 @@ impl Banner {
             let _ = p.send_event(BannerEvent::Hide);
         }
     }
+
+    /// FR-18: black out the Host's monitors while `who` works on it (the
+    /// stream still shows the real screen), or lift it with `None`.
+    pub async fn blackout(&self, who: Option<&str>) -> Result<(), String> {
+        let Some(p) = &self.proxy else {
+            return Err("no screen to black out".into());
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        p.send_event(BannerEvent::Blackout(who.map(String::from), tx))
+            .map_err(|_| "the banner is gone".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap_or_else(|_| Err("no answer from the screen".into()))
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+    }
+}
+
+/// The black screen's message: white on black, centred, at `scale`.
+pub fn render_notice(lines: &[String], w: usize, h: usize, scale: usize) -> Vec<u32> {
+    let mut px = vec![0u32; w * h];
+    let line_h = 14 * scale;
+    let top = h.saturating_sub(lines.len() * line_h) / 2;
+    for (row, line) in lines.iter().enumerate() {
+        let cols = line.chars().count();
+        let left = w.saturating_sub(cols * 8 * scale) / 2;
+        for (col, ch) in line.chars().enumerate() {
+            let glyph = font8x8::legacy::BASIC_LEGACY[(ch as usize).min(127)];
+            for (gy, bits) in glyph.iter().enumerate() {
+                for gx in 0..8 {
+                    if bits >> gx & 1 == 0 {
+                        continue;
+                    }
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let (x, y) = (
+                                left + (col * 8 + gx) * scale + dx,
+                                top + row * line_h + gy * scale + dy,
+                            );
+                            if x < w && y < h {
+                                px[y * w + x] = 0x00C8_C8C8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    px
+}
+
+fn notice_lines(who: &str) -> Vec<String> {
+    let who: String = who
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_control())
+        .take(60)
+        .collect();
+    vec![
+        format!("This computer is being used remotely by {who}."),
+        "The screen is dark for privacy.".into(),
+        String::new(),
+        "Press Ctrl+Alt+Del to get your keyboard and mouse back,".into(),
+        "then Ctrl+Alt+Shift+X to end the session.".into(),
+    ]
+}
+
+/// Keep `w` out of screen capture, so the Controller still sees the
+/// desktop under it (Windows 10 2004+).
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn exclude_from_capture(w: &Window) -> Result<(), String> {
+    use ::windows::Win32::Foundation::HWND;
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = w.window_handle().map_err(|e| e.to_string())?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return Err("not a Win32 window".into());
+    };
+    // SAFETY: the HWND belongs to a live window we own.
+    unsafe { SetWindowDisplayAffinity(HWND(h.hwnd.get() as *mut _), WDA_EXCLUDEFROMCAPTURE) }
+        .map_err(|e| format!("this Windows version cannot hide a window from capture ({e})"))
+}
+
+struct Blackout {
+    window: Arc<Window>,
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    lines: Vec<String>,
 }
 
 /// Signalled when the Host user clicks "End session" (FR-10).
@@ -115,6 +207,8 @@ struct App {
     cursor_x: f64,
     /// FR-10; `None` if it could not be registered (the button still works).
     hotkey: Option<relay_input::hotkey::SessionHotkey>,
+    /// FR-18 privacy screen, while on.
+    blackout: Option<Blackout>,
 }
 
 impl App {
@@ -128,6 +222,75 @@ impl App {
 }
 
 impl App {
+    fn open_blackout(&mut self, el: &ActiveEventLoop, who: &str) -> Result<(), String> {
+        if !cfg!(target_os = "windows") {
+            return Err("black screen is only available on Windows hosts for now".into());
+        }
+        if let Some(b) = &mut self.blackout {
+            b.lines = notice_lines(who);
+            return Ok(());
+        }
+        // Cover the whole virtual desktop.
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for m in el.available_monitors() {
+            let (p, s) = (m.position(), m.size());
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x + s.width as i32);
+            y1 = y1.max(p.y + s.height as i32);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return Err("no monitors".into());
+        }
+        let attrs = Window::default_attributes()
+            .with_title("Relay — privacy screen")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_position(PhysicalPosition::new(x0, y0))
+            .with_inner_size(PhysicalSize::new((x1 - x0) as u32, (y1 - y0) as u32));
+        let window = Arc::new(el.create_window(attrs).map_err(|e| e.to_string())?);
+        // Clicks (the Controller's included) go to the apps underneath.
+        let _ = window.set_cursor_hittest(false);
+        #[cfg(target_os = "windows")]
+        exclude_from_capture(&window)?;
+        let surface = softbuffer::Context::new(window.clone())
+            .and_then(|c| softbuffer::Surface::new(&c, window.clone()))
+            .ok();
+        self.blackout = Some(Blackout {
+            window,
+            surface,
+            lines: notice_lines(who),
+        });
+        self.draw_blackout();
+        // FR-9: the red banner stays above the black screen.
+        if let Some(b) = &self.window {
+            b.set_window_level(WindowLevel::Normal);
+            b.set_window_level(WindowLevel::AlwaysOnTop);
+        }
+        Ok(())
+    }
+
+    fn draw_blackout(&mut self) {
+        let Some(b) = &mut self.blackout else { return };
+        let Some(s) = &mut b.surface else { return };
+        let size = b.window.inner_size();
+        let (Some(nw), Some(nh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
+        if s.resize(nw, nh).is_err() {
+            return;
+        }
+        let scale = (b.window.scale_factor() * 2.0).round().max(2.0) as usize;
+        let px = render_notice(&b.lines, size.width as usize, size.height as usize, scale);
+        if let Ok(mut buf) = s.buffer_mut() {
+            let n = buf.len().min(px.len());
+            buf[..n].copy_from_slice(&px[..n]);
+            let _ = buf.present();
+        }
+    }
+
     fn draw(&mut self) {
         let (Some(w), Some(s), Some((text, _))) = (&self.window, &mut self.surface, &self.text)
         else {
@@ -200,7 +363,19 @@ impl ApplicationHandler<BannerEvent> for App {
                 self.draw();
                 self.hotkey(true);
             }
+            BannerEvent::Blackout(who, done) => {
+                let r = match who {
+                    Some(who) => self.open_blackout(el, &who),
+                    None => {
+                        self.blackout = None;
+                        Ok(())
+                    }
+                };
+                let _ = done.send(r);
+            }
             BannerEvent::Hide => {
+                // The session is over: never leave the screen dark.
+                self.blackout = None;
                 self.hotkey(false);
                 self.text = None;
                 if let Some(w) = &self.window {
@@ -211,7 +386,13 @@ impl ApplicationHandler<BannerEvent> for App {
         }
     }
 
-    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        if self.blackout.as_ref().is_some_and(|b| b.window.id() == id) {
+            if matches!(ev, WindowEvent::RedrawRequested | WindowEvent::Resized(_)) {
+                self.draw_blackout();
+            }
+            return;
+        }
         match ev {
             WindowEvent::RedrawRequested | WindowEvent::Resized(_) => self.draw(),
             WindowEvent::CursorMoved { position, .. } => self.cursor_x = position.x,
@@ -270,6 +451,7 @@ where
         hotkey: relay_input::hotkey::SessionHotkey::new(Box::new(|| end_requested().notify_one()))
             .map_err(|e| tracing::warn!("end-session hotkey unavailable: {e}"))
             .ok(),
+        blackout: None,
     };
     event_loop.run_app(&mut app)?;
     worker
@@ -294,5 +476,19 @@ mod tests {
         let (px, w, h) = render(&t, 2);
         assert_eq!(px.len(), (w * h) as usize);
         assert!(px.contains(&FG) && px.contains(&BG));
+    }
+
+    #[test]
+    fn privacy_notice_is_centred_text() {
+        let lines = notice_lines("alice\u{7}");
+        assert!(lines[0].contains("alice") && !lines[0].contains('\u{7}'));
+        assert!(
+            lines.iter().any(|l| l.contains("Ctrl+Alt+Del")),
+            "how to get control back"
+        );
+        let px = render_notice(&lines, 1200, 400, 2);
+        assert_eq!(px.len(), 1200 * 400);
+        assert_eq!(px[0], 0, "black");
+        assert!(px.iter().any(|&p| p != 0), "text drawn");
     }
 }

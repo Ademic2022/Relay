@@ -227,3 +227,10 @@ impl InputInjector for SendInputInjector {
         Ok(())
     }
 }
+
+/// See [`crate::block_local_input`].
+pub fn block_local_input(on: bool) -> Result<(), InputError> {
+    // SAFETY: plain Win32 call; needs an elevated process (the Agent runs
+    // as SYSTEM).
+    unsafe { BlockInput(on.into()) }.map_err(|e| InputError::Platform(format!("BlockInput: {e}")))
+}

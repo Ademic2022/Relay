@@ -26,7 +26,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const MARGIN: f32 = 8.0;
-const PAD: usize = 4;
+pub const PAD: usize = 4;
 
 pub struct Overlay {
     pipeline: wgpu::RenderPipeline,
@@ -35,8 +35,30 @@ pub struct Overlay {
     uniform: wgpu::Buffer,
     tex: Option<(wgpu::Texture, wgpu::BindGroup, u32, u32)>,
     pub visible: bool,
-    /// Anchor at the bottom-left instead of the top-left.
-    pub bottom: bool,
+    pub anchor: Anchor,
+}
+
+/// Where an overlay sits in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Anchor {
+    #[default]
+    TopLeft,
+    BottomLeft,
+    /// Top edge, centred (the session toolbar, FR-19).
+    TopCenter,
+    /// Centred both ways (the file manager).
+    Center,
+}
+
+/// Top-left corner (physical pixels) of a `w`×`h` overlay in a `vw`×`vh`
+/// window.
+pub fn place(anchor: Anchor, w: f32, h: f32, vw: f32, vh: f32) -> (f32, f32) {
+    match anchor {
+        Anchor::TopLeft => (MARGIN, MARGIN),
+        Anchor::BottomLeft => (MARGIN, vh - MARGIN - h),
+        Anchor::TopCenter => (((vw - w) / 2.0).max(0.0), 0.0),
+        Anchor::Center => (((vw - w) / 2.0).max(0.0), ((vh - h) / 2.0).max(0.0)),
+    }
 }
 
 /// Rasterise `lines` (ASCII) at integer `scale`: white text on a
@@ -160,7 +182,7 @@ impl Overlay {
             uniform,
             tex: None,
             visible: false,
-            bottom: false,
+            anchor: Anchor::TopLeft,
         }
     }
 
@@ -231,6 +253,13 @@ impl Overlay {
         );
     }
 
+    /// Where it is drawn (physical pixels: x, y, w, h), if visible.
+    pub fn rect(&self, vw: f32, vh: f32) -> Option<(f32, f32, f32, f32)> {
+        let (_, _, w, h) = self.tex.as_ref().filter(|_| self.visible)?;
+        let (x, y) = place(self.anchor, *w as f32, *h as f32, vw, vh);
+        Some((x, y, *w as f32, *h as f32))
+    }
+
     /// Record the overlay into `pass` for a `vw`×`vh` surface.
     pub fn draw(&self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, vw: f32, vh: f32) {
         let Some((_, bind, w, h)) = &self.tex else {
@@ -239,12 +268,9 @@ impl Overlay {
         if !self.visible {
             return;
         }
-        let x0 = -1.0 + 2.0 * MARGIN / vw;
-        let y0 = if self.bottom {
-            -1.0 + 2.0 * (MARGIN + *h as f32) / vh
-        } else {
-            1.0 - 2.0 * MARGIN / vh
-        };
+        let (px, py) = place(self.anchor, *w as f32, *h as f32, vw, vh);
+        let x0 = -1.0 + 2.0 * px / vw;
+        let y0 = 1.0 - 2.0 * py / vh;
         let rect = [x0, y0, x0 + 2.0 * *w as f32 / vw, y0 - 2.0 * *h as f32 / vh];
         let bytes: Vec<u8> = rect.iter().flat_map(|f| f.to_le_bytes()).collect();
         queue.write_buffer(&self.uniform, 0, &bytes);

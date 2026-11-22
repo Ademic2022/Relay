@@ -30,16 +30,22 @@ pub const TAG: u8 = Channel::Files as u8;
 
 /// Host: answer file requests on `conn` until it closes (one task per
 /// request stream, so a big transfer does not block browsing). All of
-/// them share `throttle` (FR-30).
+/// them share `throttle` (FR-30). While `allowed` is false (the Host
+/// turned file transfer off, FR-11) every request is refused.
 pub async fn accept_loop(
     conn: relay_net::quic::Connection,
     throttle: std::sync::Arc<throttle::Throttle>,
+    allowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     while let Ok((tx, mut rx)) = conn.accept_bi().await {
-        let throttle = throttle.clone();
+        let (throttle, allowed) = (throttle.clone(), allowed.clone());
         tokio::spawn(async move {
             let mut tag = [0u8; 1];
             if rx.read_exact(&mut tag).await.is_err() || tag[0] != TAG {
+                return;
+            }
+            if !allowed.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = host::refuse(tx, rx).await;
                 return;
             }
             if let Err(e) = host::serve(tx, rx, &throttle).await {
@@ -93,6 +99,13 @@ mod tests {
         }
 
         fn with_throttle(throttle: Arc<throttle::Throttle>) -> Self {
+            Self::with(throttle, Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        }
+
+        fn with(
+            throttle: Arc<throttle::Throttle>,
+            allowed: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
             let lo = "127.0.0.1:0".parse().unwrap();
             let (a, b) = (crate::identity::ephemeral(), crate::identity::ephemeral());
             let (host, _) = quic::node(lo, &a.tls, Some(&[quic::ALPN])).unwrap();
@@ -101,7 +114,7 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(i) = ep.accept().await {
                     if let Ok(c) = i.await {
-                        tokio::spawn(accept_loop(c, throttle.clone()));
+                        tokio::spawn(accept_loop(c, throttle.clone(), allowed.clone()));
                     }
                 }
             });
@@ -366,6 +379,21 @@ mod tests {
         assert!(up > 1.0, "upload took {up:.2} s");
         assert!(down > 1.2, "download took {down:.2} s");
         assert!(up < 4.0 && down < 4.0, "not stalled: {up:.2} / {down:.2} s");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_can_turn_file_transfer_off_and_on() {
+        let d = tmp("perm");
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rig = Rig::with(Arc::default(), allowed.clone());
+        let conn = rig.connect().await;
+        let err = client::list(&conn, d.to_str().unwrap()).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("turned file transfer off"),
+            "{err}"
+        );
+        allowed.store(true, Ordering::Relaxed);
+        client::list(&conn, d.to_str().unwrap()).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

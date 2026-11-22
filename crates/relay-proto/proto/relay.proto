@@ -82,6 +82,20 @@ message Permissions {
   bool control = 2;
   bool clipboard = 3;
   bool file_transfer = 4;
+  bool privacy = 5;             // block input / black screen offered (FR-18)
+}
+
+// Controller → Host (FR-18): unattended sessions with control only.
+message PrivacyRequest {
+  bool block_input = 1;         // the Host's own keyboard and mouse
+  bool blackout = 2;            // black the Host's monitors (not the stream)
+}
+
+// Host → Controller: what is in effect now.
+message PrivacyState {
+  bool block_input = 1;
+  bool blackout = 2;
+  string error = 3;
 }
 
 message Display {
@@ -185,6 +199,8 @@ message ControlMessage {
     PathSwitched path_switched = 15;
     HostDetails host_details = 16;
     WakeResult wake_result = 17;
+    PrivacyRequest privacy = 18;
+    PrivacyState privacy_state = 19;
   }
 }
 

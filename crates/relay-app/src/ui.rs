@@ -53,6 +53,8 @@ pub enum Cmd {
     End,
     NewPassword,
     Chat(String),
+    /// FR-11: control, clipboard, file transfer for the running session.
+    Permissions([bool; 3]),
 }
 
 pub fn parse(line: &str) -> Option<Cmd> {
@@ -63,6 +65,11 @@ pub fn parse(line: &str) -> Option<Cmd> {
         "end" => Cmd::End,
         "new_password" => Cmd::NewPassword,
         "chat" => Cmd::Chat(v.get("text")?.as_str()?.to_string()),
+        "permissions" => Cmd::Permissions([
+            v.get("control")?.as_bool()?,
+            v.get("clipboard")?.as_bool()?,
+            v.get("files")?.as_bool()?,
+        ]),
         _ => return None,
     })
 }
@@ -123,6 +130,10 @@ mod tests {
     #[test]
     fn commands_parse() {
         assert_eq!(parse(r#"{"cmd":"accept"}"#), Some(Cmd::Accept));
+        assert_eq!(
+            parse(r#"{"cmd":"permissions","control":false,"clipboard":true,"files":false}"#),
+            Some(Cmd::Permissions([false, true, false]))
+        );
         assert_eq!(
             parse(r#"{"cmd":"chat","text":"hi"}"#),
             Some(Cmd::Chat("hi".into()))

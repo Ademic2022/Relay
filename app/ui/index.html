@@ -120,6 +120,13 @@
                     <div class="hint"><span class="dot live" aria-hidden="true"></span> <span id="session-mode"></span> · <span id="session-timer">0:00</span></div>
                   </div>
                 </div>
+                <!-- FR-11: what the viewer may do, changeable any time -->
+                <div class="perms" id="perms" role="group" aria-labelledby="perms-title">
+                  <div class="perms-title" id="perms-title" data-i18n="perm.title">The viewer may</div>
+                  <label class="perm"><span data-i18n="perm.control">Use mouse and keyboard</span><input type="checkbox" class="switch" id="perm-control"></label>
+                  <label class="perm"><span data-i18n="perm.clipboard">Share the clipboard</span><input type="checkbox" class="switch" id="perm-clipboard"></label>
+                  <label class="perm"><span data-i18n="perm.files">Transfer files</span><input type="checkbox" class="switch" id="perm-files"></label>
+                </div>
                 <div class="chat" aria-label="Chat">
                   <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
                   <form id="chat-form" class="chat-input">

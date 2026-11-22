@@ -181,6 +181,28 @@ async fn serve(conn: Connection, st: State) -> anyhow::Result<()> {
             let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
             Ok(())
         }
+        // FR-6: online status for a controller's address book.
+        Some(rdv::message::Msg::Presence(p)) => {
+            let online: Vec<u32> = {
+                let hosts = st.hosts.lock().expect("poisoned");
+                p.ids
+                    .iter()
+                    .take(256)
+                    .copied()
+                    .filter(|id| hosts.contains_key(id))
+                    .collect()
+            };
+            quic::send_msg(
+                &mut tx,
+                &msg(rdv::message::Msg::PresenceResult(rdv::PresenceResult {
+                    online,
+                })),
+            )
+            .await?;
+            let _ = tx.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            Ok(())
+        }
         _ => anyhow::bail!("unexpected first message"),
     }
 }

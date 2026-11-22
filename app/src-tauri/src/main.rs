@@ -195,6 +195,11 @@ fn start_host(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
                     let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
                 }
             }
+            if ev.get("event").and_then(Value::as_str) == Some("chat")
+                && ev.get("from_me").and_then(Value::as_bool) != Some(true)
+            {
+                chat_toast(&app2, &ev);
+            }
             let _ = app2.emit("host", ev);
         }
         // stdout closed: the host exited.
@@ -252,7 +257,15 @@ enum HostCmd {
     Decline,
     End,
     NewPassword,
-    Chat { text: String },
+    Chat {
+        text: String,
+    },
+    /// FR-11: what the viewer may do in the running session.
+    Permissions {
+        control: bool,
+        clipboard: bool,
+        files: bool,
+    },
 }
 
 #[tauri::command]
@@ -263,6 +276,13 @@ fn host_cmd(cmd: HostCmd, state: State<'_, AppState>) -> Result<(), String> {
         HostCmd::End => serde_json::json!({ "cmd": "end" }),
         HostCmd::NewPassword => serde_json::json!({ "cmd": "new_password" }),
         HostCmd::Chat { text } => serde_json::json!({ "cmd": "chat", "text": text }),
+        HostCmd::Permissions {
+            control,
+            clipboard,
+            files,
+        } => serde_json::json!({
+            "cmd": "permissions", "control": control, "clipboard": clipboard, "files": files,
+        }),
     };
     let mut slot = state.host.lock().expect("poisoned");
     let h = slot.as_mut().ok_or("Relay is not running")?;
@@ -500,6 +520,35 @@ fn run_relay(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// FR-6: which saved Device IDs are online. Runs off the UI thread.
+#[tauri::command]
+async fn presence(ids: Vec<String>) -> Result<Vec<String>, String> {
+    let ids: Vec<String> = ids
+        .into_iter()
+        .filter(|i| i.len() == 9 && i.bytes().all(|b| b.is_ascii_digit()))
+        .take(256)
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec!["presence"];
+        args.extend(ids.iter().map(String::as_str));
+        run_relay(&args)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let v: Value = serde_json::from_str(out.trim()).map_err(|e| e.to_string())?;
+    Ok(v["online"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[tauri::command]
 fn settings() -> Result<Vec<SettingRow>, String> {
     Ok(run_relay(&["config", "list"])?
@@ -554,9 +603,38 @@ fn version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
 
+/// FR-25: a chat message must be seen even when the window is minimised
+/// or behind other windows: system notification plus a taskbar/Dock nudge.
+fn chat_toast(app: &AppHandle, ev: &Value) {
+    use tauri_plugin_notification::NotificationExt;
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let in_view = w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false);
+    if in_view {
+        return; // the chat panel shows it
+    }
+    let from = ev.get("name").and_then(Value::as_str).unwrap_or("Viewer");
+    let text: String = ev
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("Relay: message from {from}"))
+        .body(text)
+        .show();
+    let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(tauri_plugin_notification::init())
         .setup(|_app| {
             // Windows draws its own title bar (our dark one is macOS-only,
             // see index.html): make it dark to match.
@@ -573,6 +651,7 @@ fn main() {
             connect,
             viewer_code,
             recent,
+            presence,
             forget_recent,
             rename_device,
             settings,

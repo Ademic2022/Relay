@@ -22,7 +22,9 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use super::files_ui::{FileCmd, FileManager};
-use super::{Shared, UserEvent, ViewOptions, keys, overlay::Overlay};
+use super::overlay::{Anchor, Overlay};
+use super::toolbar::{self, Tool, Toolbar};
+use super::{Shared, UserEvent, ViewOptions, keys};
 
 const SHADER: &str = r#"
 struct Uniforms { scale: vec2<f32>, _pad: vec2<f32> };
@@ -83,6 +85,7 @@ struct Gpu {
     overlay: Overlay,
     chat_panel: Overlay,
     files_panel: Overlay,
+    toolbar: Overlay,
 }
 
 pub struct App {
@@ -106,6 +109,10 @@ pub struct App {
     pending_power: Option<(Instant, bool)>,
     /// Short message shown at the start of the title.
     notice: Option<(Instant, String)>,
+    /// Session toolbar (FR-19).
+    toolbar: Toolbar,
+    /// Last pointer position in the window (physical px).
+    pointer: (f64, f64),
 }
 
 /// In-window chat (FR-24).
@@ -373,6 +380,8 @@ impl App {
             status: "Connecting…".into(),
             close_reason: None,
             last_title: Instant::now(),
+            toolbar: Toolbar::default(),
+            pointer: (0.0, 0.0),
         }
     }
 
@@ -565,6 +574,10 @@ impl App {
         };
         gpu.window.set_title(&title);
         self.last_title = Instant::now();
+        // Keep the toolbar's labels (unread count, display) current.
+        if self.toolbar.shown {
+            self.refresh_toolbar();
+        }
     }
 
     fn control_allowed(&self) -> bool {
@@ -696,6 +709,175 @@ impl App {
         c.applied = Some(want);
     }
 
+    // ------------------------------------------------ actions (FR-19)
+    // Shared by the Ctrl+Alt shortcuts and the toolbar buttons.
+
+    fn toggle_stats(&mut self) {
+        if let Some(g) = &mut self.gpu {
+            g.overlay.visible = !g.overlay.visible;
+        }
+        self.update_overlay();
+        self.refresh_toolbar();
+    }
+
+    fn cycle_quality(&mut self) {
+        self.quality = match self.quality {
+            v1::QualityMode::Speed => v1::QualityMode::Balanced,
+            v1::QualityMode::Balanced => v1::QualityMode::Quality,
+            v1::QualityMode::Quality => v1::QualityMode::Speed,
+        };
+        let _ = self
+            .ui_tx
+            .send(crate::auth::control(v1::control_message::Msg::SetQuality(
+                v1::SetQuality {
+                    mode: self.quality as i32,
+                },
+            )));
+        tracing::info!("quality mode {:?}", self.quality);
+        self.update_overlay();
+        self.refresh_toolbar();
+    }
+
+    fn send_sas(&mut self) {
+        let _ = self
+            .ui_tx
+            .send(crate::auth::control(v1::control_message::Msg::SendSas(
+                v1::SendSas {},
+            )));
+        self.notify("Ctrl+Alt+Del sent");
+    }
+
+    fn toggle_files(&mut self) {
+        self.files.open = !self.files.open;
+        if self.files.open {
+            self.input.release_all();
+            if self.files.remote_dir().is_empty() {
+                let _ = self.files_tx.send(FileCmd::ListRemote(String::new()));
+            }
+        }
+        self.refresh_files();
+    }
+
+    fn toggle_chat(&mut self) {
+        if self.chat.compose.take().is_none() {
+            // Release anything held before keys stop reaching the host.
+            self.input.release_all();
+            self.chat.compose = Some(String::new());
+            self.chat.unread = 0;
+        }
+        self.refresh_chat();
+        self.update_title();
+        self.refresh_toolbar();
+    }
+
+    fn toggle_full_screen(&mut self) {
+        if let Some(g) = &self.gpu {
+            let fs = g.window.fullscreen().is_some();
+            g.window
+                .set_fullscreen((!fs).then_some(winit::window::Fullscreen::Borderless(None)));
+        }
+        self.refresh_toolbar();
+    }
+
+    fn tool(&mut self, el: &ActiveEventLoop, t: Tool) {
+        match t {
+            Tool::Quality => self.cycle_quality(),
+            Tool::Monitor => self.pick_monitor(KeyCode::KeyM),
+            Tool::CtrlAltDel => self.send_sas(),
+            Tool::Chat => self.toggle_chat(),
+            Tool::Files => self.toggle_files(),
+            Tool::Stats => self.toggle_stats(),
+            Tool::FullScreen => self.toggle_full_screen(),
+            Tool::BlockInput | Tool::Blackout => {
+                let (block, black) = {
+                    let h = self.shared.host.lock().expect("poisoned");
+                    (h.block_input, h.blackout)
+                };
+                let (block, black) = if t == Tool::BlockInput {
+                    (!block, black)
+                } else {
+                    (block, !black)
+                };
+                let _ = self
+                    .ui_tx
+                    .send(crate::auth::control(v1::control_message::Msg::Privacy(
+                        v1::PrivacyRequest {
+                            block_input: block,
+                            blackout: black,
+                        },
+                    )));
+            }
+            Tool::Disconnect => self.end(el),
+        }
+    }
+
+    /// Redraw the toolbar with current labels (or hide it).
+    fn refresh_toolbar(&mut self) {
+        let displays = self.shared.displays.lock().expect("poisoned").len();
+        let monitor = if displays > 1 {
+            let l = self.display_label();
+            l.split(" · ").next().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        let labels = toolbar::Labels {
+            quality: format!("{:?}", self.quality),
+            monitor,
+            unread: self.chat.unread,
+            stats_on: self.gpu.as_ref().is_some_and(|g| g.overlay.visible),
+            full_screen: self
+                .gpu
+                .as_ref()
+                .is_some_and(|g| g.window.fullscreen().is_some()),
+            privacy: {
+                let h = self.shared.host.lock().expect("poisoned");
+                (h.privacy && h.control).then_some((h.block_input, h.blackout))
+            },
+        };
+        self.toolbar.set(&labels);
+        let shown = self.toolbar.shown;
+        let line = self.toolbar.line.clone();
+        let Some(g) = &mut self.gpu else { return };
+        g.toolbar.visible = shown;
+        if shown {
+            let scale = g.window.scale_factor().round().max(1.0) as usize;
+            g.toolbar.set_text(&g.device, &g.queue, &[line], scale);
+        }
+        g.draw();
+    }
+
+    /// Is the pointer on the toolbar (so the Host must not see it)?
+    fn over_toolbar(&self) -> bool {
+        let Some(g) = &self.gpu else { return false };
+        let (vw, vh) = (g.config.width as f32, g.config.height as f32);
+        g.toolbar.rect(vw, vh).is_some_and(|(x, y, w, h)| {
+            let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
+            px >= x && px < x + w && py >= y && py < y + h
+        })
+    }
+
+    /// Show the toolbar at the top edge; hide it once the pointer leaves.
+    fn track_toolbar(&mut self) {
+        let near = self.gpu.as_ref().and_then(|g| {
+            g.toolbar
+                .rect(g.config.width as f32, g.config.height as f32)
+        });
+        let keep = near.is_some_and(|(x, y, w, h)| {
+            let (px, py) = (self.pointer.0 as f32, self.pointer.1 as f32);
+            px >= x - toolbar::KEEP_PX
+                && px < x + w + toolbar::KEEP_PX
+                && py < y + h + toolbar::KEEP_PX
+        });
+        let show = self.pointer.1 <= toolbar::REVEAL_PX || keep;
+        if show != self.toolbar.shown {
+            self.toolbar.shown = show;
+            if show {
+                self.input.release_all();
+            }
+            self.refresh_toolbar();
+        }
+    }
+
     fn end(&mut self, el: &ActiveEventLoop) {
         self.input.release_all();
         let _ = self.quit.send(true);
@@ -824,8 +1006,11 @@ impl Gpu {
         });
         let overlay = Overlay::new(&device, format);
         let mut chat_panel = Overlay::new(&device, format);
-        chat_panel.bottom = true;
-        let files_panel = Overlay::new(&device, format);
+        chat_panel.anchor = Anchor::BottomLeft;
+        let mut files_panel = Overlay::new(&device, format);
+        files_panel.anchor = Anchor::Center;
+        let mut toolbar = Overlay::new(&device, format);
+        toolbar.anchor = Anchor::TopCenter;
         Ok(Self {
             window,
             surface,
@@ -840,6 +1025,7 @@ impl Gpu {
             overlay,
             chat_panel,
             files_panel,
+            toolbar,
         })
     }
 
@@ -998,12 +1184,15 @@ impl Gpu {
                 pass.set_bind_group(0, &p.bind, &[]);
                 pass.draw(0..6, 0..1);
             }
-            self.overlay.draw(
-                &self.queue,
-                &mut pass,
-                self.config.width as f32,
-                self.config.height as f32,
-            );
+            let (vw, vh) = (self.config.width as f32, self.config.height as f32);
+            for o in [
+                &self.overlay,
+                &self.files_panel,
+                &self.chat_panel,
+                &self.toolbar,
+            ] {
+                o.draw(&self.queue, &mut pass, vw, vh);
+            }
         }
         self.queue.submit([enc.finish()]);
         self.window.pre_present_notify();
@@ -1097,6 +1286,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.status = s;
                 self.update_title();
             }
+            UserEvent::Notice(n) => {
+                if !self.control_allowed() {
+                    self.input.release_all();
+                }
+                self.notify(&n);
+                self.refresh_toolbar();
+            }
             UserEvent::Closed(reason) => {
                 self.close_reason = Some(reason);
                 self.end(el);
@@ -1131,13 +1327,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state == ElementState::Pressed && m.control_key() && m.alt_key() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyS) => {
-                            if let Some(g) = &mut self.gpu {
-                                g.overlay.visible = !g.overlay.visible;
-                            }
-                            self.update_overlay();
-                            if let Some(g) = &mut self.gpu {
-                                g.draw();
-                            }
+                            self.toggle_stats();
                             return;
                         }
                         // FR-21: Ctrl+Alt+M next monitor, Ctrl+Alt+1…9 pick one.
@@ -1158,10 +1348,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         // FR-14: Ctrl+Alt+End sends Ctrl+Alt+Del to a Windows host.
                         PhysicalKey::Code(KeyCode::End) => {
-                            let _ = self.ui_tx.send(crate::auth::control(
-                                v1::control_message::Msg::SendSas(v1::SendSas {}),
-                            ));
-                            self.notify("Ctrl+Alt+Del sent");
+                            self.send_sas();
                             return;
                         }
                         // FR-34: Ctrl+Alt+R restarts the host (Shift: Safe Mode).
@@ -1195,41 +1382,15 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyF) => {
-                            self.files.open = !self.files.open;
-                            if self.files.open {
-                                self.input.release_all();
-                                if self.files.remote_dir().is_empty() {
-                                    let _ = self.files_tx.send(FileCmd::ListRemote(String::new()));
-                                }
-                            }
-                            self.refresh_files();
+                            self.toggle_files();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyC) => {
-                            if self.chat.compose.take().is_none() {
-                                // Release anything held before keys stop
-                                // reaching the host.
-                                self.input.release_all();
-                                self.chat.compose = Some(String::new());
-                                self.chat.unread = 0;
-                            }
-                            self.refresh_chat();
-                            self.update_title();
+                            self.toggle_chat();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyQ) => {
-                            self.quality = match self.quality {
-                                v1::QualityMode::Speed => v1::QualityMode::Balanced,
-                                v1::QualityMode::Balanced => v1::QualityMode::Quality,
-                                v1::QualityMode::Quality => v1::QualityMode::Speed,
-                            };
-                            let _ = self.ui_tx.send(crate::auth::control(
-                                v1::control_message::Msg::SetQuality(v1::SetQuality {
-                                    mode: self.quality as i32,
-                                }),
-                            ));
-                            tracing::info!("quality mode {:?}", self.quality);
-                            self.update_overlay();
+                            self.cycle_quality();
                             return;
                         }
                         _ => {}
@@ -1241,12 +1402,7 @@ impl ApplicationHandler<UserEvent> for App {
                     && m.control_key()
                     && m.alt_key()
                 {
-                    if let Some(g) = &self.gpu {
-                        let fs = g.window.fullscreen().is_some();
-                        g.window.set_fullscreen(
-                            (!fs).then_some(winit::window::Fullscreen::Borderless(None)),
-                        );
-                    }
+                    self.toggle_full_screen();
                     return;
                 }
                 if self.files.open {
@@ -1265,6 +1421,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x, position.y);
+                self.track_toolbar();
+                if self.over_toolbar() {
+                    return; // FR-19: the toolbar is local
+                }
                 if self.control_allowed()
                     && let Some((x, y)) = self.normalise(position.x, position.y)
                     && self.input.last_pos != Some((x, y))
@@ -1274,6 +1435,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if self.over_toolbar() {
+                    if state == ElementState::Pressed
+                        && button == winit::event::MouseButton::Left
+                        && let Some(g) = &self.gpu
+                        && let Some((x, ..)) = g
+                            .toolbar
+                            .rect(g.config.width as f32, g.config.height as f32)
+                    {
+                        let scale = g.window.scale_factor().round().max(1.0) as usize;
+                        if let Some(t) = self.toolbar.hit(self.pointer.0 as f32 - x, scale) {
+                            self.tool(el, t);
+                        }
+                    }
+                    return;
+                }
                 if let Some(b) = map_button(button)
                     && self.control_allowed()
                 {

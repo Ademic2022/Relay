@@ -23,16 +23,18 @@ enum Msg {
 pub async fn serve(
     conn: Connection,
     targets: tokio::sync::watch::Receiver<DisplayTarget>,
-    control_allowed: bool,
-    clipboard_allowed: bool,
+    perms: std::sync::Arc<crate::perms::Perms>,
     peer_name: String,
 ) {
     let initial = *targets.borrow();
+    // The injector exists if control may ever be on this session (FR-11
+    // lets the Host turn it off and back on).
+    let may_control = perms.cap()[0];
     serve_streams(
         conn,
-        move || platform(initial, control_allowed),
+        move || platform(initial, may_control),
         Some(targets),
-        clipboard_allowed,
+        perms,
         peer_name,
     )
     .await;
@@ -75,7 +77,14 @@ pub async fn serve_with<F>(
 ) where
     F: FnOnce() -> Option<Box<dyn InputInjector>> + Send + 'static,
 {
-    serve_streams(conn, make_injector, targets, false, String::new()).await;
+    serve_streams(
+        conn,
+        make_injector,
+        targets,
+        crate::perms::Perms::new(true, false, false),
+        String::new(),
+    )
+    .await;
 }
 
 /// Route the Controller's streams: input to the injector thread,
@@ -85,15 +94,16 @@ async fn serve_streams<F>(
     conn: Connection,
     make_injector: F,
     targets: Option<tokio::sync::watch::Receiver<DisplayTarget>>,
-    clipboard_allowed: bool,
+    perms: std::sync::Arc<crate::perms::Perms>,
     peer_name: String,
 ) where
     F: FnOnce() -> Option<Box<dyn InputInjector>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Msg>();
+    let (control, block) = (perms.control.clone(), perms.block_input.clone());
     let injector = std::thread::Builder::new()
         .name("relay-input".into())
-        .spawn(move || inject_loop(rx, make_injector(), targets));
+        .spawn(move || inject_loop(rx, make_injector(), targets, control, block));
     if let Err(e) = injector {
         tracing::error!("input thread: {e}");
         return;
@@ -121,11 +131,15 @@ async fn serve_streams<F>(
                     }
                 });
             }
-            Some(Channel::Clipboard) if clipboard_allowed => {
+            Some(Channel::Clipboard) if perms.cap()[1] => {
                 if clipboard.is_none()
                     && let Some(board) = crate::clipboard::os_board()
                 {
-                    clipboard = Some(crate::clipboard::ClipboardSync::start(&conn, board));
+                    clipboard = Some(crate::clipboard::ClipboardSync::start_gated(
+                        &conn,
+                        board,
+                        perms.clipboard.clone(),
+                    ));
                 }
                 if let Some(c) = &clipboard {
                     c.receive(rx);
@@ -157,11 +171,43 @@ fn inject_loop(
     rx: mpsc::Receiver<Msg>,
     mut inj: Option<Box<dyn InputInjector>>,
     mut targets: Option<tokio::sync::watch::Receiver<DisplayTarget>>,
+    control: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    block: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     crate::rt::set_realtime();
     let mut stats = (0u32, Duration::ZERO, Duration::ZERO, Instant::now());
-    while let Ok(Msg::Event(ev, received)) = rx.recv() {
+    let mut was_on = true;
+    // FR-18: BlockInput belongs to this thread (its SendInput still works),
+    // and Windows lifts it if the thread exits.
+    let mut blocked = false;
+    loop {
+        let want = block.load(std::sync::atomic::Ordering::Relaxed);
+        if want != blocked {
+            match relay_input::block_local_input(want) {
+                Ok(()) => tracing::info!(
+                    "host keyboard and mouse {}",
+                    if want { "blocked" } else { "unblocked" }
+                ),
+                Err(e) => tracing::warn!("block host input: {e}"),
+            }
+            blocked = want;
+        }
+        let (ev, received) = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Msg::Event(ev, received)) => (ev, received),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let Some(i) = inj.as_mut() else { continue };
+        // FR-11: the Host turned control off. Let go of anything held at
+        // that moment, then drop input until it is back on.
+        if !control.load(std::sync::atomic::Ordering::Relaxed) {
+            if was_on {
+                let _ = i.release_all();
+                was_on = false;
+            }
+            continue;
+        }
+        was_on = true;
         // The Controller switched monitors: map pointer moves onto it.
         if let Some(t) = targets.as_mut()
             && t.has_changed().unwrap_or(false)
@@ -186,6 +232,9 @@ fn inject_loop(
             );
             stats = (0, Duration::ZERO, Duration::ZERO, Instant::now());
         }
+    }
+    if blocked {
+        let _ = relay_input::block_local_input(false);
     }
     if let Some(i) = inj.as_mut() {
         let _ = i.release_all();

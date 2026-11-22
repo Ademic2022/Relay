@@ -85,6 +85,19 @@ pub enum InputError {
     Platform(String),
 }
 
+/// FR-18: stop the Host's own keyboard and mouse (the Controller's input
+/// still works). Call it from the thread that injects: Windows only lets
+/// that thread's `SendInput` through. Ctrl+Alt+Del always unblocks.
+pub fn block_local_input(on: bool) -> Result<(), InputError> {
+    #[cfg(target_os = "windows")]
+    return windows::block_local_input(on);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = on;
+        Err(InputError::Unsupported)
+    }
+}
+
 /// [`DisplayTarget::id`] of the Host's "all displays" view (FR-22): the
 /// rectangle is then the whole virtual desktop, in the same units.
 pub const ALL_DISPLAYS: u32 = u32::MAX;

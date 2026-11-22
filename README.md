@@ -82,6 +82,7 @@ Viewer keys (never sent to the host):
 | Keys | Action |
 |---|---|
 | `Ctrl+Alt+Enter` | full screen |
+| pointer at the top edge | session toolbar (FR-19): quality, monitor, Ctrl+Alt+Del, chat, files, stats, full screen, disconnect, and on unattended Windows hosts "Block input" / "Black screen" (FR-18) |
 | `Ctrl+Alt+S` | stats overlay |
 | `Ctrl+Alt+Q` | cycle quality mode (Speed / Balanced / Quality; `--quality` sets the start) |
 | `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor; with 2+ host monitors the last entry is "All displays", one picture of every screen as arranged on the host (scaled to fit 3840×2160, then by the ABR; copied on the CPU, so use single monitors for lowest latency) |
@@ -138,6 +139,12 @@ works once, and a wrong code counts as a failed attempt (FR-35). The viewer asks
 when the host wants one (`--totp <CODE>` passes it up front; the app shows a code box).
 Running setup again without `--totp` turns it off.
 
+**Privacy mode (FR-18, Windows hosts).** In an unattended session with control, the viewer's
+toolbar can block the host's own keyboard and mouse and black out its monitors. The stream still
+shows the real desktop (the black window is excluded from capture), the red banner stays on top,
+the black screen says who is connected, and Ctrl+Alt+Del always gives the local user their
+keyboard and mouse back. Both end with the session and are recorded in the audit log.
+
 Connect with `relay connect <ID>` and the permanent password: no Accept prompt, but the red
 "Being controlled by …" banner still shows whenever someone is logged in (FR-33). The host user
 can end any session with the banner's **End session** button or the global hotkey
@@ -165,7 +172,9 @@ Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
 ## The Relay app
 
 `app/` is the desktop app (Tauri 2, PRD §5.1): your ID or address and password, Connect,
-recent devices, the Accept/Decline prompt, the active session with chat and End session,
+recent devices with online status (FR-6), the Accept/Decline prompt, the active session with
+chat (a notification when the window is in the background, FR-25), switches to turn the viewer's
+control, clipboard and file transfer off and on (FR-11), End session,
 settings. It drives the `relay` engine next to it (`relay host --ui`
 over stdin/stdout JSON lines; viewers start as `relay connect|view --password-stdin`). The
 remote screen opens in the native wgpu window, never in the webview.

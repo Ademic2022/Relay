@@ -33,6 +33,7 @@ mod logs;
 mod migrate;
 #[cfg(test)]
 mod netem_tests;
+mod perms;
 mod pins;
 mod rdv;
 mod rt;
@@ -286,6 +287,14 @@ enum Cmd {
         #[command(flatten)]
         server: ServerArgs,
     },
+    /// Which of these Device IDs are online (FR-6; used by the app's
+    /// Devices list). Prints {"online": [...]} as one JSON line.
+    #[command(hide = true)]
+    Presence {
+        ids: Vec<String>,
+        #[command(flatten)]
+        server: ServerArgs,
+    },
     /// Connect directly to a host's IP address (no server; FR-7).
     View {
         /// Host address, e.g. 192.168.1.20 (port defaults to 21118).
@@ -485,6 +494,18 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Cmd::Presence { ids, server } => {
+            let ids: Vec<relay_crypto::DeviceId> = ids
+                .iter()
+                .filter_map(|s| relay_crypto::DeviceId::parse(s))
+                .take(256)
+                .collect();
+            let server = server.resolve()?;
+            let online = tokio::runtime::Runtime::new()?.block_on(presence(&ids, server));
+            let list: Vec<String> = online.iter().map(|i| i.as_u32().to_string()).collect();
+            println!("{}", serde_json::json!({ "online": list }));
+            Ok(())
+        }
         Cmd::View { addr, viewer } => {
             run_viewer(viewer::Target::Direct(parse_addr(&addr)?), viewer, false)
         }
@@ -528,6 +549,63 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
             _ => relay_proto::v1::QualityMode::Speed,
         },
     })
+}
+
+/// FR-6: online = answers on this network, or registered with the server.
+async fn presence(
+    ids: &[relay_crypto::DeviceId],
+    server: Option<rdv::Server>,
+) -> Vec<relay_crypto::DeviceId> {
+    let lan = ids.iter().map(|&id| async move {
+        lan::find(id, std::time::Duration::from_millis(800))
+            .await
+            .map(|_| id)
+    });
+    let via_server = async {
+        let Some(server) = server else {
+            return Vec::new();
+        };
+        let r = async {
+            let me = identity::load()?;
+            let (node, _) =
+                relay_net::quic::node(SocketAddr::from(([0, 0, 0, 0], 0)), &me.tls, None)?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                rdv::presence(&node, &me, &server, ids),
+            )
+            .await?
+        };
+        r.await.unwrap_or_else(|e: anyhow::Error| {
+            tracing::debug!("presence via server: {e:#}");
+            Vec::new()
+        })
+    };
+    let (lan, mut online) = tokio::join!(futures_join_all(lan), via_server);
+    for id in lan.into_iter().flatten() {
+        if !online.contains(&id) {
+            online.push(id);
+        }
+    }
+    online
+}
+
+/// Await all futures (small fan-out; avoids a futures-util dependency).
+async fn futures_join_all<F>(fs: impl IntoIterator<Item = F>) -> Vec<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for f in fs {
+        set.spawn(f);
+    }
+    let mut out = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(v) = r {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// A Device ID ("123 456 789") or an address.

@@ -110,6 +110,23 @@ fn file_op(op: &v1::FileOpRequest) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
+/// FR-11: answer a request with "file transfer is off", whatever it was.
+pub async fn refuse(mut tx: SendStream, mut rx: RecvStream) -> anyhow::Result<()> {
+    const OFF: &str = "the host turned file transfer off";
+    let first = quic::recv_msg::<v1::FileMessage>(&mut rx, MAX_MSG).await?;
+    let reply = match first.and_then(|m| m.msg) {
+        Some(Msg::ListDir(l)) => msg(Msg::Listing(v1::DirListing {
+            path: l.path,
+            entries: Vec::new(),
+            error: OFF.into(),
+        })),
+        _ => ack(0, OFF),
+    };
+    quic::send_msg(&mut tx, &reply).await?;
+    let _ = tx.finish();
+    Ok(())
+}
+
 /// Handle one request stream (after its tag byte).
 pub async fn serve(
     mut tx: SendStream,

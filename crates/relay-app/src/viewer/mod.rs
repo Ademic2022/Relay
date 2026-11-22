@@ -24,6 +24,7 @@ mod files_ui;
 mod keys;
 mod overlay;
 mod render;
+mod toolbar;
 
 /// How long a partially received frame may wait for missing slices. Long
 /// enough for a big keyframe to cross a slow link; it adds no latency,
@@ -40,6 +41,8 @@ pub enum UserEvent {
     Files(files_ui::FileEvent),
     Cursor(v1::CursorMessage),
     Status(String),
+    /// A short message for the title (e.g. a permission change, FR-11).
+    Notice(String),
     Closed(String),
 }
 
@@ -74,6 +77,10 @@ pub struct HostInfo {
     pub control: bool,
     pub clipboard: bool,
     pub file_transfer: bool,
+    /// FR-18 offered by the host, and what is in effect.
+    pub privacy: bool,
+    pub block_input: bool,
+    pub blackout: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -573,6 +580,7 @@ async fn network(
                     h.control = p.control;
                     h.clipboard = p.clipboard;
                     h.file_transfer = p.file_transfer;
+                    h.privacy = p.privacy;
                 }
                 if !p.control {
                     tracing::info!("host allows viewing only");
@@ -759,7 +767,7 @@ async fn network(
     };
 
     let host_closed = receive(
-        &conn, dec_tx, &ctl_tx, &shared, &mut rx, &mut quit, &switched,
+        &conn, dec_tx, &ctl_tx, &shared, &mut rx, &mut quit, &switched, &proxy,
     )
     .await;
     if let Some(m) = migration {
@@ -783,6 +791,7 @@ async fn network(
 }
 
 /// Datagram receive loop. Returns why the session ended.
+#[allow(clippy::too_many_arguments)] // the session loop's handles, all borrowed
 async fn receive(
     conn: &quinn::Connection,
     dec_tx: SyncSender<CompleteFrame>,
@@ -791,6 +800,7 @@ async fn receive(
     ctl_rx: &mut quinn::RecvStream,
     quit: &mut tokio::sync::watch::Receiver<bool>,
     switched: &tokio::sync::Notify,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
 ) -> Ended {
     let mut reasm = Reassembler::new(REASSEMBLY_DEADLINE);
     let mut fb = crate::feedback::Feedback::new();
@@ -865,6 +875,54 @@ async fn receive(
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::SelectMonitor(sel)) })) => {
                     shared.current_display.store(sel.display_id, std::sync::atomic::Ordering::Relaxed);
+                }
+                // FR-18: what the host applied.
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::PrivacyState(p)) })) => {
+                    {
+                        let mut h = shared.host.lock().expect("poisoned");
+                        h.block_input = p.block_input;
+                        h.blackout = p.blackout;
+                    }
+                    let text = if !p.error.is_empty() {
+                        format!("Privacy mode: {}", p.error)
+                    } else {
+                        let on = |b: bool| if b { "on" } else { "off" };
+                        format!(
+                            "Host input blocked: {} · Host screen black: {}",
+                            on(p.block_input),
+                            on(p.blackout)
+                        )
+                    };
+                    let _ = proxy.send_event(UserEvent::Notice(text));
+                }
+                // FR-11: the Host changed what we may do.
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::Permissions(p)) })) => {
+                    let before = {
+                        let mut h = shared.host.lock().expect("poisoned");
+                        let before = (h.control, h.clipboard, h.file_transfer);
+                        h.control = p.control;
+                        h.clipboard = p.clipboard;
+                        h.file_transfer = p.file_transfer;
+                        h.privacy = p.privacy;
+                        before
+                    };
+                    let change = |was: bool, now: bool, what: &str| {
+                        (was != now).then(|| format!("{what} {}", if now { "on" } else { "off" }))
+                    };
+                    let changes: Vec<String> = [
+                        change(before.0, p.control, "control"),
+                        change(before.1, p.clipboard, "clipboard"),
+                        change(before.2, p.file_transfer, "file transfer"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    if !changes.is_empty() {
+                        let _ = proxy.send_event(UserEvent::Notice(format!(
+                            "The host turned {}",
+                            changes.join(", ")
+                        )));
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return Ended::Lost("host closed the connection".into()),

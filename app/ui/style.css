@@ -325,3 +325,15 @@ input:focus { outline: none; border-color: var(--brand-2); box-shadow: 0 0 0 3px
 }
 
 .head-actions { display: flex; gap: 10px; align-items: center; }
+
+/* FR-11: per-session permissions */
+.perms { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; margin: 12px 0; }
+.perms-title { font-size: 12.5px; color: var(--text-3); font-weight: 600; }
+.perm { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13.5px; }
+.perm:has(input:disabled) { opacity: .5; }
+
+/* FR-6: online status on a device's avatar */
+.avatar { position: relative; }
+.presence { position: absolute; right: -2px; bottom: -2px; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--bg); }
+.presence.on { background: #22a35a; }
+.presence.off { background: var(--line-strong); }

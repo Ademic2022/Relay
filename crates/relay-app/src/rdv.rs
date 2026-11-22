@@ -305,6 +305,32 @@ async fn host_once(
 
 // ------------------------------------------------------------ controller
 
+/// Which of `ids` are registered with the server right now (FR-6).
+pub async fn presence(
+    node: &Node,
+    me: &Me,
+    server: &Server,
+    ids: &[DeviceId],
+) -> anyhow::Result<Vec<DeviceId>> {
+    let rdv = rendezvous_conn(node, me, server).await?;
+    let (mut tx, mut rx) = rdv.open_bi().await?;
+    quic::send_msg(
+        &mut tx,
+        &msg(rdv::message::Msg::Presence(rdv::Presence {
+            ids: ids.iter().map(|i| i.as_u32()).collect(),
+        })),
+    )
+    .await?;
+    let r = match quic::recv_msg::<rdv::Message>(&mut rx, MAX_MSG).await? {
+        Some(rdv::Message {
+            msg: Some(rdv::message::Msg::PresenceResult(r)),
+        }) => r.online,
+        _ => bail!("the server does not support presence (update it)"),
+    };
+    rdv.close(0u32.into(), b"done");
+    Ok(r.into_iter().filter_map(DeviceId::from_u32).collect())
+}
+
 /// Find `target` through the server and connect to it.
 pub async fn connect_by_id(
     node: &Node,
@@ -648,6 +674,18 @@ mod tests {
         let (path, echoed) = controller(&mut w, "Pw3dEf7h", false).await.unwrap();
         assert_eq!(path, Path::PeerToPeer);
         assert_eq!(echoed, MARKER);
+    }
+
+    #[tokio::test]
+    async fn presence_reports_registered_hosts_only() {
+        let w = world("Pw3dEf7h").await;
+        let me = crate::identity::ephemeral();
+        let (node, _) = quic::node(lo(), &me.tls, None).unwrap();
+        let nobody = DeviceId::derive(&[77u8; 32], 0);
+        let online = presence(&node, &me, &w.server, &[w.host_id, nobody])
+            .await
+            .unwrap();
+        assert_eq!(online, vec![w.host_id]);
     }
 
     #[tokio::test]

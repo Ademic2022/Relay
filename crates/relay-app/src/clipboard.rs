@@ -59,7 +59,23 @@ pub fn os_board() -> Option<Box<dyn Board>> {
 
 impl ClipboardSync {
     /// Start syncing over `conn`: opens our outgoing stream now.
-    pub fn start(conn: &Connection, mut board: Box<dyn Board>) -> Self {
+    pub fn start(conn: &Connection, board: Box<dyn Board>) -> Self {
+        Self::start_gated(
+            conn,
+            board,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+    }
+
+    /// Like [`start`](Self::start), but nothing moves either way while
+    /// `enabled` is false (FR-11: the Host turned clipboard off). Copies
+    /// made meanwhile are not sent later.
+    pub fn start_gated(
+        conn: &Connection,
+        mut board: Box<dyn Board>,
+        enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
         let (in_tx, in_rx) = mpsc::channel::<String>();
         let (out_tx, mut out_rx) = tmpsc::unbounded_channel::<String>();
         std::thread::Builder::new()
@@ -70,8 +86,10 @@ impl ClipboardSync {
                 loop {
                     match in_rx.recv_timeout(POLL) {
                         Ok(text) => {
-                            board.set(&text);
-                            last = Some(text);
+                            if enabled.load(Ordering::Relaxed) {
+                                board.set(&text);
+                                last = Some(text);
+                            }
                             continue;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -79,6 +97,10 @@ impl ClipboardSync {
                     }
                     let now = board.get();
                     if now != last {
+                        if !enabled.load(Ordering::Relaxed) {
+                            last = now;
+                            continue;
+                        }
                         if let Some(t) = now
                             .as_ref()
                             .filter(|t| !t.is_empty() && t.len() <= MAX_TEXT)

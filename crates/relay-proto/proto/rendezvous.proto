@@ -47,6 +47,16 @@ message Rendezvous {
   string relay_addr = 3;         // "ip:port"
 }
 
+// Controller → server: which of these Device IDs are online now (FR-6)?
+// Tells nothing a Lookup would not, and starts no connection.
+message Presence {
+  repeated uint32 ids = 1;       // at most 256
+}
+
+message PresenceResult {
+  repeated uint32 online = 1;
+}
+
 message Message {
   oneof msg {
     Register register = 1;
@@ -54,5 +64,7 @@ message Message {
     Lookup lookup = 3;
     LookupResult lookup_result = 4;
     Rendezvous incoming = 5;     // server → host: a controller is coming
+    Presence presence = 6;
+    PresenceResult presence_result = 7;
   }
 }

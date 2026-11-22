@@ -584,11 +584,23 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             "Being viewed and controlled"
         }
     );
+    // FR-11: what the Controller may do; the Host can change it any time.
+    // FR-18: block input / black screen only for unattended sessions.
+    let perms = crate::perms::Perms::with_privacy(
+        !opts.view_only,
+        opts.clipboard && !opts.view_only,
+        opts.files && !opts.view_only,
+        unattended,
+    );
+    let mut blackout = false;
     // FR-9 / FR-33: the banner shows whenever someone is at the Host,
     // attended or not. The Controller has no way to hide it.
     crate::ui::emit(
         "session_start",
-        serde_json::json!({ "name": name, "unattended": unattended, "view_only": opts.view_only }),
+        serde_json::json!({
+            "name": name, "unattended": unattended, "view_only": opts.view_only,
+            "permissions": perms.to_json(),
+        }),
     );
     let banner_shown = !unattended || relay_service::console_user_present();
     if banner_shown {
@@ -610,16 +622,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         })),
     )
     .await?;
-    quic::send_msg(
-        &mut tx,
-        &control(Msg::Permissions(v1::Permissions {
-            view: true,
-            control: !opts.view_only,
-            clipboard: opts.clipboard && !opts.view_only,
-            file_transfer: opts.files && !opts.view_only,
-        })),
-    )
-    .await?;
+    quic::send_msg(&mut tx, &control(Msg::Permissions(perms.to_proto()))).await?;
     // Cursor channel (§6 rule 5): its own stream, below input priority.
     let (cursor_tx, mut cursor_rx) = tokio::sync::mpsc::unbounded_channel::<v1::CursorMessage>();
     let cursor_task = {
@@ -647,8 +650,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     let input_task = tokio::spawn(crate::host_input::serve(
         conn.clone(),
         target_rx,
-        !opts.view_only,
-        opts.clipboard && !opts.view_only,
+        perms.clone(),
         if peer.name.is_empty() {
             "viewer".into()
         } else {
@@ -658,10 +660,11 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     // File transfer (FR-26–28): one task per request stream.
     // FR-30: transfers slow down while the video is being squeezed.
     let file_throttle = Arc::new(crate::files::throttle::Throttle::default());
-    let files_task = (opts.files && !opts.view_only).then(|| {
+    let files_task = perms.cap()[2].then(|| {
         tokio::spawn(crate::files::accept_loop(
             conn.clone(),
             file_throttle.clone(),
+            perms.files.clone(),
         ))
     });
     // Chat (FR-24): lines typed in this terminal go to the viewer.
@@ -767,6 +770,8 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
 
     let mut control_state = crate::sender::ControlState::new(opts.bitrate_kbps);
     let mut quit = false;
+    // FR-11: permission changes from the app.
+    let mut ui_cmds = opts.ui.then(crate::ui::commands);
     let reason = loop {
         tokio::select! {
             m = quic::recv_msg::<v1::ControlMessage>(&mut rx, MAX_MESSAGE_LEN) => match m {
@@ -783,6 +788,38 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::AbrFeedback(fb)) })) => {
                     control_state.on_feedback(&fb, &shared);
                     file_throttle.on_feedback(&fb, shared.bitrate_kbps.load(Ordering::Relaxed));
+                }
+                // FR-18: privacy mode, unattended sessions with control only.
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::Privacy(p)) })) => {
+                    let mut error = String::new();
+                    if !perms.privacy || !perms.control.load(Ordering::Relaxed) {
+                        error = "only available in unattended sessions with control".into();
+                    } else {
+                        let block = p.block_input && cfg!(target_os = "windows");
+                        if p.block_input && !block {
+                            error = "blocking input is only available on Windows hosts for now".into();
+                        }
+                        perms.block_input.store(block, Ordering::Relaxed);
+                        if p.blackout != blackout {
+                            let who = name.clone();
+                            match st.banner.blackout(p.blackout.then_some(who.as_str())).await {
+                                Ok(()) => blackout = p.blackout,
+                                Err(e) => error = e,
+                            }
+                        }
+                        let on = |b: bool| if b { "on" } else { "off" };
+                        audit(&format!(
+                            "PRIVACY {name}: block input {}, black screen {}",
+                            on(p.block_input),
+                            on(blackout)
+                        ));
+                    }
+                    let state = v1::PrivacyState {
+                        block_input: perms.block_input.load(Ordering::Relaxed),
+                        blackout,
+                        error,
+                    };
+                    let _ = quic::send_msg(&mut tx, &control(Msg::PrivacyState(state))).await;
                 }
                 // FR-34: remote reboot, unattended sessions with control only.
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::Power(p)) })) => {
@@ -840,6 +877,37 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 let _ = tx.finish();
                 quit = true;
                 break "ended by host (Ctrl+C)";
+            }
+            Some(want) = async {
+                match &mut ui_cmds {
+                    Some(r) => loop {
+                        match r.recv().await {
+                            Ok(crate::ui::Cmd::Permissions(p)) => break Some(p),
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => break None,
+                        }
+                    },
+                    None => std::future::pending().await,
+                }
+            } => {
+                let [c, cb, f] = perms.set(want);
+                // Without control there is no privacy mode either.
+                if !c && (blackout || perms.block_input.load(Ordering::Relaxed)) {
+                    perms.block_input.store(false, Ordering::Relaxed);
+                    if blackout {
+                        let _ = st.banner.blackout(None).await;
+                        blackout = false;
+                    }
+                    let _ = quic::send_msg(&mut tx, &control(Msg::PrivacyState(v1::PrivacyState::default()))).await;
+                }
+                let on = |b: bool| if b { "on" } else { "off" };
+                audit(&format!(
+                    "PERMISSIONS {name}: control {}, clipboard {}, files {}",
+                    on(c), on(cb), on(f)
+                ));
+                crate::ui::emit("permissions", perms.to_json());
+                let _ = quic::send_msg(&mut tx, &control(Msg::Permissions(perms.to_proto()))).await;
             }
             // FR-10: the Host user clicked "End session" on the banner.
             _ = crate::banner::end_requested().notified() => {

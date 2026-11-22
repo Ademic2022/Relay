@@ -210,8 +210,8 @@ Priority: **P0** = must have in v1, **P1** = should have, **P2** = nice to have.
 - **FR-38 (P0)** Disabling unattended access (or uninstalling) removes the Service and invalidates the permanent password immediately.
 
 ### 7.8 Logging & audit
-- **FR-39 (P0)** Local audit log on the Host: every connection (who, when, duration, attended/unattended, files transferred). Viewable in the UI. Cannot be cleared by the Controller.
-- **FR-40 (P0)** Diagnostic logs (rotating, 10 MB cap) with a "Copy logs" button. No screen content or keystrokes in logs.
+- **FR-39 (P0)** Local audit log on the Host: every connection (who, when, duration, attended/unattended, files transferred). Cannot be cleared by the Controller. Read with `relay audit` on the Host; the desktop app does not show it (decided 2026-11-22: not needed in the UI).
+- **FR-40 (P0)** Diagnostic logs (rotating, 10 MB cap), read or attached to support requests with `relay logs`. No screen content or keystrokes in logs. No in-app log viewer or "Copy logs" button (decided 2026-11-22).
 
 ### 7.9 Settings
 - **FR-41 (P0)** Settings: custom rendezvous/relay server address + server public key (self-hosting), default quality mode, clipboard sync, ⌘/Ctrl mapping, start with OS, language.
