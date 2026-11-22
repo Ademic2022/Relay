@@ -9,7 +9,8 @@
 //!
 //! It holds the device key the agent registers with, and
 //! `unattended.conf`: the permanent password's OPAQUE verifier (never the
-//! password) and the optional allow-list of Controller Device IDs.
+//! password), the optional allow-list of Controller Device IDs and the
+//! optional TOTP secret (FR-36).
 //! Deleting the file disables unattended access at once: a running agent
 //! checks for it every few seconds and exits.
 //!
@@ -66,6 +67,8 @@ pub struct Config {
     pub verifier: HostPassword,
     /// Controller Device IDs allowed in; empty = any with the password.
     pub allow: Vec<u32>,
+    /// Second factor after the password (FR-36).
+    pub totp: Option<relay_crypto::totp::Secret>,
 }
 
 impl Config {
@@ -91,13 +94,18 @@ fn load_from(dir: &Path) -> anyhow::Result<Option<Config>> {
     if lines.next() != Some("relay-unattended v1") {
         bail!("unattended.conf: unknown format");
     }
-    let (mut allow, mut verifier) = (Vec::new(), None);
+    let (mut allow, mut verifier, mut totp) = (Vec::new(), None, None);
     for l in lines {
         if let Some(ids) = l.strip_prefix("allow ") {
             allow = ids
                 .split(',')
                 .filter_map(|i| i.trim().parse().ok())
                 .collect();
+        } else if let Some(t) = l.strip_prefix("totp ") {
+            totp = Some(
+                relay_crypto::totp::Secret::from_base32(t)
+                    .context("unattended.conf: bad totp secret")?,
+            );
         } else if let Some(h) = l.strip_prefix("verifier ") {
             let bytes: Vec<u8> = (0..h.len() / 2)
                 .filter_map(|i| u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok())
@@ -110,6 +118,7 @@ fn load_from(dir: &Path) -> anyhow::Result<Option<Config>> {
     Ok(Some(Config {
         verifier: verifier.context("unattended.conf has no verifier")?,
         allow,
+        totp,
     }))
 }
 
@@ -130,11 +139,20 @@ fn keystore_open(b: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(b.to_vec())
 }
 
-pub fn save(password: &str, allow: &[u32]) -> anyhow::Result<()> {
-    save_to(&system_dir(), password, allow)
+pub fn save(
+    password: &str,
+    allow: &[u32],
+    totp: Option<&relay_crypto::totp::Secret>,
+) -> anyhow::Result<()> {
+    save_to(&system_dir(), password, allow, totp)
 }
 
-fn save_to(dir: &Path, password: &str, allow: &[u32]) -> anyhow::Result<()> {
+fn save_to(
+    dir: &Path,
+    password: &str,
+    allow: &[u32],
+    totp: Option<&relay_crypto::totp::Secret>,
+) -> anyhow::Result<()> {
     if !relay_crypto::password::permanent_acceptable(password) {
         bail!(
             "password too weak: at least {} characters, mixed",
@@ -142,7 +160,7 @@ fn save_to(dir: &Path, password: &str, allow: &[u32]) -> anyhow::Result<()> {
         );
     }
     let v = HostPassword::new(password, PasswordKind::Permanent)?;
-    let text = format!(
+    let mut text = format!(
         "relay-unattended v1\nallow {}\nverifier {}\n",
         allow
             .iter()
@@ -151,6 +169,9 @@ fn save_to(dir: &Path, password: &str, allow: &[u32]) -> anyhow::Result<()> {
             .join(","),
         relay_net::hex(&v.to_bytes())
     );
+    if let Some(t) = totp {
+        text.push_str(&format!("totp {}\n", t.to_base32()));
+    }
     write_private(&config_path_in(dir), &keystore_seal(text.as_bytes())?)
 }
 
@@ -216,6 +237,8 @@ pub struct SetupArgs {
     pub no_service: bool,
     pub dry_run: bool,
     pub password: Option<String>,
+    /// Also require an authenticator-app code (FR-36).
+    pub totp: bool,
 }
 
 /// FR-31 wizard (terminal form).
@@ -235,6 +258,9 @@ pub fn setup(a: SetupArgs) -> anyhow::Result<()> {
             "Would store a permanent-password verifier in {}",
             config_path().display()
         );
+        if a.totp {
+            println!("Would also require a code from an authenticator app.");
+        }
         if allow.is_empty() {
             println!("Would allow any device that knows the password.");
         } else {
@@ -270,9 +296,13 @@ pub fn setup(a: SetupArgs) -> anyhow::Result<()> {
             break p;
         },
     };
-    save(&password, &allow)?;
+    let totp = if a.totp { Some(enrol_totp()?) } else { None };
+    save(&password, &allow, totp.as_ref())?;
     // The agent's identity (and so its Device ID) is created once and kept.
     relay_crypto::keystore::load_or_create_device_key(keystore().as_ref())?;
+    if totp.is_some() {
+        println!("Two-factor code required for every unattended connection.");
+    }
     println!(
         "Permanent password set. Allowed devices: {}",
         if allow.is_empty() {
@@ -298,6 +328,43 @@ pub fn setup(a: SetupArgs) -> anyhow::Result<()> {
     crate::logs::set_data_dir(system_dir());
     crate::logs::audit("UNATTENDED ACCESS ENABLED");
     Ok(())
+}
+
+/// Show the new secret as a QR code and check one code from the app
+/// before saving, so nobody locks themselves out with a mistyped secret.
+fn enrol_totp() -> anyhow::Result<relay_crypto::totp::Secret> {
+    let secret = relay_crypto::totp::Secret::generate()?;
+    let host = crate::host::hostname();
+    let uri = secret.uri(&host);
+    println!("\nScan this with an authenticator app (1Password, Google Authenticator, …):\n");
+    match qrcode::QrCode::new(uri.as_bytes()) {
+        Ok(q) => println!(
+            "{}",
+            q.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        ),
+        Err(_) => println!("{uri}"),
+    }
+    println!("Or enter this key by hand: {}\n", secret.to_base32());
+    // Scripted setup (RELAY_UNATTENDED_TOTP_CONFIRM=0) cannot type a code.
+    if std::env::var("RELAY_UNATTENDED_TOTP_CONFIRM").as_deref() == Ok("0") {
+        return Ok(secret);
+    }
+    for _ in 0..3 {
+        let code = rpassword::prompt_password("Code shown in the app: ")?;
+        if secret.verify(&code, unix_secs(), None).is_some() {
+            return Ok(secret);
+        }
+        println!("  That code does not match. Check the clock on both devices.");
+    }
+    bail!("two-factor setup not confirmed; nothing was changed")
+}
+
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub fn disable() -> anyhow::Result<()> {
@@ -343,6 +410,12 @@ pub fn status() -> anyhow::Result<()> {
         Ok(None) => {}
         Err(e) => println!("(cannot read the configuration: {e:#})"),
     }
+    if let Ok(Some(c)) = load() {
+        println!(
+            "Two-factor code: {}",
+            if c.totp.is_some() { "required" } else { "off" }
+        );
+    }
     Ok(())
 }
 
@@ -357,8 +430,18 @@ mod tests {
         let d = std::env::temp_dir().join(format!("relay-unattended-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         assert!(load_from(&d).unwrap().is_none());
-        assert!(save_to(&d, "short", &[]).is_err(), "weak passwords refused");
-        save_to(&d, "correct-horse-battery-staple", &[123_456_789]).unwrap();
+        assert!(
+            save_to(&d, "short", &[], None).is_err(),
+            "weak passwords refused"
+        );
+        let secret = relay_crypto::totp::Secret::from_bytes([5; 20]);
+        save_to(
+            &d,
+            "correct-horse-battery-staple",
+            &[123_456_789],
+            Some(&secret),
+        )
+        .unwrap();
         // Bytes, not text: on Windows the file is DPAPI-sealed binary.
         let raw = std::fs::read(config_path_in(&d)).unwrap();
         assert!(
@@ -367,6 +450,7 @@ mod tests {
         );
         let c = load_from(&d).unwrap().unwrap();
         assert_eq!(c.allow, vec![123_456_789]);
+        assert_eq!(c.totp, Some(secret));
         assert!(c.allows(relay_crypto::DeviceId::from_u32(123_456_789)));
         assert!(!c.allows(relay_crypto::DeviceId::from_u32(987_654_321)));
         assert!(

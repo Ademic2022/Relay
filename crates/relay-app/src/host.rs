@@ -137,6 +137,8 @@ struct HostState {
     banner: crate::banner::Banner,
     creds: Mutex<Arc<Credentials>>,
     limiters: Mutex<Limiters>,
+    /// Last TOTP step accepted: a code works once (FR-36).
+    totp_last: Mutex<Option<u64>>,
     /// Held for the whole streaming session: one Controller at a time.
     streaming: tokio::sync::Mutex<()>,
     quit: tokio::sync::Notify,
@@ -278,6 +280,7 @@ async fn serve(
         banner,
         creds: Mutex::new(Arc::new(creds)),
         limiters: Mutex::new(limiters),
+        totp_last: Mutex::new(None),
         streaming: tokio::sync::Mutex::new(()),
         quit: tokio::sync::Notify::new(),
     });
@@ -416,6 +419,38 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     .await;
     let unattended = match result {
         Ok(auth::HostAuth::Ok(kind)) => {
+            // FR-36: the password passed; now the authenticator code. A
+            // wrong code costs the same try as a wrong password (FR-35).
+            let totp = st.unattended.as_ref().and_then(|c| c.totp.as_ref());
+            if let (v1::PasswordKind::Permanent, Some(secret)) = (kind, totp) {
+                let code = match auth::host_code(&mut tx, &mut rx).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        audit(&format!("REFUSED {name}: no two-factor code ({e})"));
+                        conn.close(1u32.into(), b"no code");
+                        return Ok(SessionOutcome::Rejected);
+                    }
+                };
+                let accepted = {
+                    let mut last = st.totp_last.lock().expect("poisoned");
+                    let step = secret.verify(&code, crate::unattended::unix_secs(), *last);
+                    if step.is_some() {
+                        *last = step;
+                    }
+                    step.is_some()
+                };
+                if !accepted {
+                    audit(&format!("FAILED two-factor code from {name}"));
+                    println!("  ! Wrong two-factor code from {name}");
+                    crate::ui::emit("failed_login", serde_json::json!({ "name": name }));
+                    return match lock {
+                        Some(d) => {
+                            reject(&mut tx, v1::AuthResult::LockedOut, d.as_millis() as u32).await
+                        }
+                        None => reject(&mut tx, v1::AuthResult::BadCode, 0).await,
+                    };
+                }
+            }
             let mut l = st.limiters.lock().expect("poisoned");
             l.ip.record_success(&ip);
             l.key.record_success(&peer.key);
@@ -573,8 +608,14 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         },
     ));
     // File transfer (FR-26–28): one task per request stream.
-    let files_task = (opts.files && !opts.view_only)
-        .then(|| tokio::spawn(crate::files::accept_loop(conn.clone())));
+    // FR-30: transfers slow down while the video is being squeezed.
+    let file_throttle = Arc::new(crate::files::throttle::Throttle::default());
+    let files_task = (opts.files && !opts.view_only).then(|| {
+        tokio::spawn(crate::files::accept_loop(
+            conn.clone(),
+            file_throttle.clone(),
+        ))
+    });
     // Chat (FR-24): lines typed in this terminal go to the viewer.
     let chat = crate::chat::ChatLink::start(conn);
     let chat_task = if opts.ui {
@@ -682,6 +723,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::AbrFeedback(fb)) })) => {
                     control_state.on_feedback(&fb, &shared);
+                    file_throttle.on_feedback(&fb, shared.bitrate_kbps.load(Ordering::Relaxed));
                 }
                 // FR-34: remote reboot, unattended sessions with control only.
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::Power(p)) })) => {
@@ -804,7 +846,7 @@ fn proto_display(d: &relay_capture::DisplayInfo) -> v1::Display {
     }
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()

@@ -13,7 +13,6 @@
   <svg class="sprite" aria-hidden="true">
     <symbol id="i-swap" viewBox="0 0 24 24"><path d="M17 3l4 4-4 4M21 7H8M7 21l-4-4 4-4M3 17h13"/></symbol>
     <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
-    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></symbol>
@@ -162,7 +161,9 @@
             <div class="card-head">
               <h2><span data-i18n="devices.title">Devices</span>
                 <span class="info" title="Computers you have connected to from here."><svg class="ic"><use href="#i-info"/></svg></span></h2>
+              <div class="head-actions">
               <button class="btn primary" id="new-connection"><svg class="ic"><use href="#i-plus"/></svg><span data-i18n="control.new">New connection</span></button>
+              </div>
             </div>
             <p class="muted" data-i18n="devices.sub">Computers you have connected to. Rename them to find them faster.</p>
             <div class="filter" id="filter-wrap" hidden>
@@ -239,16 +240,6 @@
               </div>
             </article>
 
-            <article class="card">
-              <div class="card-head">
-                <h2><span data-i18n="activity.title">Connection log</span>
-                  <span class="info" title="Every connection to this computer. A viewer can't change it."><svg class="ic"><use href="#i-info"/></svg></span></h2>
-                <button type="button" id="refresh-audit" class="btn outline"><svg class="ic"><use href="#i-refresh"/></svg><span data-i18n="activity.refresh">Refresh</span></button>
-              </div>
-              <p class="hint" data-i18n="activity.hint">Every connection to this computer. A viewer can't change this log.</p>
-              <ol id="audit" class="timeline"></ol>
-            </article>
-
             <div class="save-bar">
               <span id="settings-msg" class="msg" role="status" aria-live="polite"></span>
               <button type="submit" class="btn primary" data-i18n="settings.save">Save changes</button>
@@ -280,6 +271,23 @@
       <div class="modal-actions">
         <button type="button" id="pw-cancel" class="btn outline" data-i18n="cancel">Cancel</button>
         <button type="submit" id="pw-connect" class="btn primary"><span data-i18n="control.connect">Connect</span><svg class="ic"><use href="#i-arrow"/></svg></button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Two-factor code for unattended access (FR-36) -->
+  <div id="code-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="code-title">
+    <form class="modal-box left" id="code-form">
+      <h2 id="code-title" data-i18n="code.title">Two-factor code</h2>
+      <p class="muted" id="code-body"></p>
+      <div class="field">
+        <label for="code-input" data-i18n="code.label">Code</label>
+        <input id="code-input" class="mono" inputmode="numeric" autocomplete="one-time-code" maxlength="7" pattern="[0-9 ]{6,7}" required>
+      </div>
+      <p id="code-msg" class="msg" role="status" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button type="button" id="code-cancel" class="btn outline" data-i18n="cancel">Cancel</button>
+        <button type="submit" class="btn primary" data-i18n="code.submit">Continue</button>
       </div>
     </form>
   </div>

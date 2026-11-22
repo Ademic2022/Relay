@@ -16,7 +16,7 @@ Built milestone by milestone (PRD §12).
 | M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
 | M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
 | M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
-| M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders not yet |
+| M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders with keep-both / overwrite / skip (FR-29) |
 | M7 Unattended access | permanent password + allow-list, agent mode, banner window, audit + diagnostic logs, reboot/safe mode/Ctrl+Alt+Del, auto-reconnect, Windows service + macOS launchd supervisor; tested locally without installing the service; reboot/login-screen acceptance needs real machines |
 | M8 Ship | settings (`relay config`), signed auto-update, macOS .pkg + Windows MSI scripts, release workflow, docs; unsigned builds only so far (no certificates), MSI not built here, Tauri UI not started |
 
@@ -86,11 +86,16 @@ Viewer keys (never sent to the host):
 | `Ctrl+Alt+Q` | cycle quality mode (Speed / Balanced / Quality; `--quality` sets the start) |
 | `Ctrl+Alt+M`, `Ctrl+Alt+1`…`9` | next monitor / pick a monitor |
 | `Ctrl+Alt+C` | chat panel (typing goes to the chat while open; Enter sends, Esc closes) |
-| `Ctrl+Alt+F` | file manager: this computer ↔ host (Tab, Enter, Backspace, F5 copy, F7 mkdir, F2 rename, F8 delete, F9 cancel, Esc) |
+| `Ctrl+Alt+F` | file manager: this computer ↔ host (Tab, Enter, Backspace, F5 copy file or folder, F6 if a name is taken, F7 mkdir, F2 rename, F8 delete, F9 cancel, Esc) |
 
-Drop files on the viewer window to upload them to the host folder open in the file manager
-(the host user's Downloads until one is opened). Transfers resume after a dropped connection
-and are BLAKE3-verified; name clashes get " (1)", " (2)"… `relay host --no-files` turns file
+Drop files or folders on the viewer window to upload them to the host folder open in the file
+manager (the host user's Downloads until one is opened). Folders go recursively, file by file;
+symlinks are not followed. Transfers resume after a dropped connection and are BLAKE3-verified.
+When a name is taken, F6 picks what happens: keep both (default: " (1)", " (2)"…), overwrite,
+or skip. For folders, keep both makes a new "name (1)" folder; overwrite and skip merge into the
+existing one and decide file by file. While the video is being squeezed (queueing delay
+growing, or heavy loss), transfers in both directions are held to 10% of the video bitrate
+(never below 64 kbps) and get their speed back after about 3 s of clean reports (FR-30). `relay host --no-files` turns file
 access off (it is always off with `--view-only`).
 
 On the host, chat messages appear in the terminal; type a line and press Enter to reply.
@@ -107,7 +112,7 @@ Reach your own computer when nobody is at it, including after a reboot and at th
 screen. Run once, as administrator:
 
 ```sh
-sudo relay unattended setup [--allow "123 456 789"]   # macOS (Windows: elevated terminal)
+sudo relay unattended setup [--allow "123 456 789"] [--totp]   # macOS (Windows: elevated terminal)
 relay unattended setup --dry-run                     # see what it would install
 relay unattended status
 sudo relay unattended disable                        # removes the service; password stops working at once
@@ -125,6 +130,14 @@ key, owner-only, in `/Library/Application Support/Relay` (macOS) or `%ProgramDat
   Accessibility (and optionally Full Disk Access) in System Settings. The FileVault unlock
   screen at power-on runs before macOS and cannot be reached.
 
+**Two-factor code (FR-36).** With `--totp`, setup shows a QR code (and the key, to type by
+hand) for any authenticator app, and asks for one code before it saves anything. Every
+unattended connection then needs the permanent password *and* the current 6-digit code. The
+code is checked only after the password passes, inside the encrypted connection; each code
+works once, and a wrong code counts as a failed attempt (FR-35). The viewer asks for the code
+when the host wants one (`--totp <CODE>` passes it up front; the app shows a code box).
+Running setup again without `--totp` turns it off.
+
 Connect with `relay connect <ID>` and the permanent password: no Accept prompt, but the red
 "Being controlled by …" banner still shows whenever someone is logged in (FR-33). The host user
 can end any session with the banner's **End session** button or the global hotkey
@@ -139,7 +152,7 @@ Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
 
 `app/` is the desktop app (Tauri 2, PRD §5.1): your ID or address and password, Connect,
 recent devices, the Accept/Decline prompt, the active session with chat and End session,
-the connection log and settings. It drives the `relay` engine next to it (`relay host --ui`
+settings. It drives the `relay` engine next to it (`relay host --ui`
 over stdin/stdout JSON lines; viewers start as `relay connect|view --password-stdin`). The
 remote screen opens in the native wgpu window, never in the webview.
 

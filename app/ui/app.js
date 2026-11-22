@@ -117,10 +117,7 @@ function setupTabs() {
     }
     tab.focus();
     if (tab.id === "tab-devices") loadRecent();
-    if (tab.id === "tab-settings") {
-      loadSettings();
-      loadAudit();
-    }
+    if (tab.id === "tab-settings") loadSettings();
   };
   tabs.forEach((tab, i) => {
     tab.addEventListener("click", () => select(tab));
@@ -554,58 +551,60 @@ function setupConnect() {
 }
 
 /** @param {ViewerEvent} ev */
-function onViewer(ev) {
-  if (ev.state !== "ended") return;
-  if (ev.ok) notice(t("control.closed", { target: ev.target }), null, "info");
-  else notice(ev.message ?? "", null, "error");
+/** @type {number | null} PID of the viewer waiting for a code. */
+let codePid = null;
+
+/** FR-36: the host wants a two-factor code; ask, then pass it on. */
+function askCode(target, pid) {
+  codePid = pid;
+  $("code-body").textContent = t("code.body", { target });
+  $("code-msg").textContent = "";
+  const input = /** @type {HTMLInputElement} */ ($("code-input"));
+  input.value = "";
+  $("code-modal").hidden = false;
+  input.focus();
 }
 
-// ---------------------------------------------------------------- activity
-
-/** Split one audit line into time, kind and detail. */
-function parseAudit(line) {
-  const m = line.match(/^(\S+)\s+(.*)$/);
-  const when = m ? new Date(m[1]) : null;
-  const rest = m ? m[2] : line;
-  /** @type {[RegExp, string, string][]} */
-  const kinds = [
-    [/^SESSION START /, "audit.start", "start"],
-    [/^SESSION END /, "audit.end", "end"],
-    [/^FAILED login from /, "audit.failed", "bad"],
-    [/^REFUSED /, "audit.refused", "bad"],
-    [/^DECLINED /, "audit.declined", "warn"],
-    [/^UNATTENDED /i, "audit.unattended", "warn"],
-  ];
-  for (const [re, label, cls] of kinds) {
-    if (re.test(rest)) return { when, label: t(label), cls, detail: rest.replace(re, "") };
-  }
-  return { when, label: t("audit.other"), cls: "", detail: rest };
-}
-
-async function loadAudit() {
-  const list = $("audit");
-  try {
-    const text = /** @type {string} */ (await invoke("audit_log"));
-    const lines = text.split("\n").filter((l) => l.trim() && !l.startsWith("("));
-    if (lines.length === 0) {
-      list.replaceChildren(el("li", "empty-row", t("activity.empty")));
+function setupCode() {
+  const input = /** @type {HTMLInputElement} */ ($("code-input"));
+  const send = async (/** @type {string} */ code) => {
+    if (codePid === null) return;
+    try {
+      await invoke("viewer_code", { pid: codePid, code });
+      codePid = null;
+      $("code-modal").hidden = true;
+    } catch (err) {
+      const msg = $("code-msg");
+      msg.className = "msg error";
+      msg.textContent = String(err);
+    }
+  };
+  $("code-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const code = input.value.replace(/\s/g, "");
+    if (!/^\d{6}$/.test(code)) {
+      $("code-msg").className = "msg error";
+      $("code-msg").textContent = t("code.bad");
       return;
     }
-    list.replaceChildren(
-      ...lines.reverse().map((l) => {
-        const a = parseAudit(l);
-        const li = el("li");
-        const when =
-          a.when && !isNaN(a.when.getTime())
-            ? a.when.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-            : "";
-        li.append(el("span", "when", when), el("span", `tag ${a.cls}`, a.label), el("span", "what", a.detail));
-        return li;
-      }),
-    );
-  } catch (err) {
-    list.replaceChildren(el("li", "empty-row", String(err)));
+    send(code);
+  });
+  $("code-cancel").addEventListener("click", () => send(""));
+}
+
+function onViewer(ev) {
+  if (ev.state === "code") {
+    askCode(ev.target, ev.pid);
+    return;
   }
+  if (ev.state !== "ended") return;
+  if (codePid !== null) {
+    // The connection that wanted a code is gone.
+    codePid = null;
+    $("code-modal").hidden = true;
+  }
+  if (ev.ok) notice(t("control.closed", { target: ev.target }), null, "info");
+  else notice(ev.message ?? "", null, "error");
 }
 
 // ---------------------------------------------------------------- settings
@@ -701,6 +700,7 @@ async function main() {
   $("kbd-k").textContent = isMac ? "⌘ K" : "Ctrl K";
   setupTabs();
   setupConnect();
+  setupCode();
   setupDevices();
   setupSeg();
   setupSettings();
@@ -725,7 +725,6 @@ async function main() {
   $("copy-pw").addEventListener("click", () => copyText($("my-pw").textContent ?? ""));
   $("new-pw").addEventListener("click", () => invoke("host_cmd", { cmd: { cmd: "new_password" } }));
   $("end-session").addEventListener("click", () => invoke("host_cmd", { cmd: { cmd: "end" } }));
-  $("refresh-audit").addEventListener("click", loadAudit);
   $("notice-x").addEventListener("click", () => notice(""));
   $("status-warn").addEventListener("click", () => invoke("open_privacy_settings", { pane: "screen" }));
   $("consent-accept").addEventListener("click", () => {
@@ -741,6 +740,7 @@ async function main() {
     if (!$("consent").hidden) $("consent-decline").click();
     else if (!$("pw-modal").hidden) $("pw-modal").hidden = true;
     else if (!$("rename-modal").hidden) $("rename-modal").hidden = true;
+    else if (!$("code-modal").hidden) $("code-cancel").click();
   });
   $("chat-form").addEventListener("submit", (e) => {
     e.preventDefault();

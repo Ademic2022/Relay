@@ -103,6 +103,10 @@ struct ViewerArgs {
     /// so it never appears in the process list).
     #[arg(long, conflicts_with = "password")]
     password_stdin: bool,
+    /// Two-factor code from the host owner's authenticator app, if the
+    /// host asks for one (FR-36). Prompted for when needed if omitted.
+    #[arg(long, value_name = "CODE")]
+    totp: Option<String>,
     /// Measure glass-to-glass latency from the host's --test-pattern
     /// timestamp stripe (clocks must be synced across machines).
     #[arg(long)]
@@ -145,6 +149,9 @@ enum UnattendedCmd {
         /// Print what would be done and change nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Also require a code from an authenticator app (FR-36).
+        #[arg(long)]
+        totp: bool,
     },
     /// Remove the service and invalidate the permanent password (FR-38).
     Disable,
@@ -321,11 +328,13 @@ fn main() -> anyhow::Result<()> {
                 allow,
                 no_service,
                 dry_run,
+                totp,
             } => unattended::setup(unattended::SetupArgs {
                 allow,
                 no_service,
                 dry_run,
                 password: None,
+                totp,
             }),
             UnattendedCmd::Disable => unattended::disable(),
             UnattendedCmd::Status => unattended::status(),
@@ -431,9 +440,11 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
         }
         None => rpassword::prompt_password(format!("Password for {target}: "))?,
     };
+    let target_label = target.to_string();
     viewer::run(viewer::ViewOptions {
         target,
         password: password.trim().to_string(),
+        ask_code: Some(ask_code(v.totp.clone(), v.password_stdin, target_label)),
         force_relay,
         measure: v.measure,
         cmd_ctrl_swap: !v.no_cmd_ctrl_swap && st.flag("cmd_ctrl_swap"),
@@ -449,6 +460,30 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
             _ => relay_proto::v1::QualityMode::Speed,
         },
     })
+}
+
+/// FR-36: a `--totp` code is used once; after that (a reconnect needs a
+/// fresh code) ask the terminal, or the app over the stdin pipe.
+fn ask_code(given: Option<String>, from_app: bool, target: String) -> auth::AskCode {
+    let given = std::sync::Mutex::new(given);
+    auth::AskCode(std::sync::Arc::new(move || {
+        if let Some(c) = given.lock().expect("poisoned").take() {
+            return Ok(c);
+        }
+        if from_app {
+            ui::enable();
+            ui::emit("totp_required", serde_json::json!({ "target": target }));
+            let mut l = String::new();
+            std::io::stdin().read_line(&mut l)?;
+            if l.trim().is_empty() {
+                anyhow::bail!(auth::Refused("two-factor code cancelled".into()));
+            }
+            return Ok(l);
+        }
+        Ok(rpassword::prompt_password(format!(
+            "Two-factor code for {target} (from the authenticator app): "
+        ))?)
+    }))
 }
 
 fn parse_size(s: &str) -> anyhow::Result<(u32, u32)> {

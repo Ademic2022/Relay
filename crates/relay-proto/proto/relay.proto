@@ -42,6 +42,9 @@ message Hello {
 }
 
 // Opaque PAKE (OPAQUE) messages; contents defined by relay-crypto.
+// Steps 1-3 are KE1/KE2/KE3. With TOTP on (FR-36) the Host then sends
+// step 4 (empty: "code needed") and the Controller answers step 5 with
+// the 6 digits as ASCII.
 message AuthMessage {
   uint32 step = 1;
   bytes payload = 2;
@@ -60,6 +63,7 @@ enum AuthResult {
   AUTH_RESULT_LOCKED_OUT = 3;   // FR-35
   AUTH_RESULT_NOT_WHITELISTED = 4;
   AUTH_RESULT_DECLINED = 5;     // Host user clicked Decline / timed out (FR-8)
+  AUTH_RESULT_BAD_CODE = 6;     // wrong or reused TOTP code (FR-36)
 }
 
 message AuthOutcome {
@@ -291,12 +295,21 @@ enum FileOp {
   FILE_OP_MKDIR = 1;
   FILE_OP_RENAME = 2;
   FILE_OP_DELETE = 3;
+  FILE_OP_MKDIRS = 4;           // create with parents; fine if it exists (FR-29)
 }
 
 message FileOpRequest {
   FileOp op = 1;
   string path = 2;
   string new_path = 3;
+}
+
+// What to do when the destination name is taken (FR-29). Folders are sent
+// file by file, so the policy applies to each file.
+enum Conflict {
+  CONFLICT_RENAME = 0;          // keep both: "name (1).ext"
+  CONFLICT_OVERWRITE = 1;
+  CONFLICT_SKIP = 2;
 }
 
 // Upload (Controller → Host): `path` is the destination folder and `name`
@@ -311,6 +324,7 @@ message TransferStart {
   uint64 resume_from_chunk = 5;
   bool upload = 6;              // true = Controller to Host
   string name = 7;
+  Conflict conflict = 8;        // upload: the Host applies it
 }
 
 message FileChunk {
@@ -323,6 +337,7 @@ message TransferAck {
   uint64 next_chunk = 1;
   string error = 2;
   bool cancelled = 3;
+  bool skipped = 4;             // name taken and the policy is skip
 }
 
 message FileMessage {

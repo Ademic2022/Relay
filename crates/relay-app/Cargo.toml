@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 relay-proto.workspace = true
+prost.workspace = true
 relay-crypto = { workspace = true, features = ["os-keystore"] }
 relay-net.workspace = true
 relay-capture.workspace = true
@@ -26,6 +27,8 @@ anyhow.workspace = true
 bytes.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
+# Terminal QR code for TOTP enrolment (FR-36).
+qrcode = { version = "0.14", default-features = false }
 getrandom.workspace = true
 quinn.workspace = true
 tokio = { workspace = true, features = ["signal", "process", "io-std", "io-util"] }
@@ -48,6 +51,8 @@ windows = { workspace = true }
 [dev-dependencies]
 ed25519-dalek.workspace = true
 relay-server = { path = "../relay-server" }
+# Paused clock for the throttle test (FR-30).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

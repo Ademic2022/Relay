@@ -84,6 +84,8 @@ pub struct ViewOptions {
     pub quality: v1::QualityMode,
     pub target: Target,
     pub password: String,
+    /// Where a two-factor code comes from if the host asks (FR-36).
+    pub ask_code: Option<crate::auth::AskCode>,
     pub force_relay: bool,
     pub measure: bool,
     pub cmd_ctrl_swap: bool,
@@ -321,7 +323,11 @@ async fn files_worker(
                 let r = client::op(&conn, op, &path, &new_name).await;
                 send(FileEvent::OpDone(r.map_err(|e| format!("{e:#}"))));
             }
-            FileCmd::Upload { local, remote_dir } => {
+            FileCmd::Upload {
+                local,
+                remote_dir,
+                conflict,
+            } => {
                 let name = local
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -334,22 +340,30 @@ async fn files_worker(
                 });
                 let (conn, send) = (conn.clone(), send.clone());
                 tokio::spawn(async move {
-                    let r = client::upload(&conn, &local, &remote_dir, progress).await;
+                    let r = if local.is_dir() {
+                        client::upload_folder(&conn, &local, &remote_dir, conflict, progress)
+                            .await
+                            .map(|s| folder_done(&s))
+                    } else {
+                        client::upload(&conn, &local, &remote_dir, conflict, progress)
+                            .await
+                            .map(|c| match c {
+                                client::Copied::To(p) => p,
+                                client::Copied::Skipped => "skipped (already on the host)".into(),
+                            })
+                    };
                     send(FileEvent::Finished {
                         name,
-                        result: r
-                            .map(|()| {
-                                if remote_dir.is_empty() {
-                                    "host Downloads".into()
-                                } else {
-                                    remote_dir
-                                }
-                            })
-                            .map_err(|e| format!("{e:#}")),
+                        result: r.map_err(|e| format!("{e:#}")),
                     });
                 });
             }
-            FileCmd::Download { remote, local_dir } => {
+            FileCmd::Download {
+                remote,
+                local_dir,
+                is_dir,
+                conflict,
+            } => {
                 let name = remote
                     .rsplit(['/', '\\'])
                     .next()
@@ -363,16 +377,38 @@ async fn files_worker(
                 });
                 let (conn, send) = (conn.clone(), send.clone());
                 tokio::spawn(async move {
-                    let r = client::download(&conn, &remote, &local_dir, progress).await;
+                    let r = if is_dir {
+                        client::download_folder(&conn, &remote, &local_dir, conflict, progress)
+                            .await
+                            .map(|s| folder_done(&s))
+                    } else {
+                        client::download(&conn, &remote, &local_dir, conflict, progress)
+                            .await
+                            .map(|c| match c {
+                                client::Copied::To(p) => p,
+                                client::Copied::Skipped => "skipped (already here)".into(),
+                            })
+                    };
                     send(FileEvent::Finished {
                         name,
-                        result: r
-                            .map(|p| p.display().to_string())
-                            .map_err(|e| format!("{e:#}")),
+                        result: r.map_err(|e| format!("{e:#}")),
                     });
                 });
             }
         }
+    }
+}
+
+fn folder_done(s: &crate::files::client::FolderSummary) -> String {
+    let files = if s.files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", s.files)
+    };
+    if s.skipped > 0 {
+        format!("{} ({files}, {} skipped)", s.to, s.skipped)
+    } else {
+        format!("{} ({files})", s.to)
     }
 }
 
@@ -470,6 +506,7 @@ async fn network(
     ViewOptions {
         target,
         password,
+        ask_code,
         force_relay,
         quality,
         clipboard,
@@ -497,7 +534,16 @@ async fn network(
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "viewer".into());
     let _ = proxy.send_event(UserEvent::Status("Waiting for the host to accept…".into()));
-    crate::auth::controller(&conn, &mut tx, &mut rx, &me, &name, &password).await?;
+    crate::auth::controller(
+        &conn,
+        &mut tx,
+        &mut rx,
+        &me,
+        &name,
+        &password,
+        ask_code.as_ref(),
+    )
+    .await?;
     let mut stream_cfg = None;
     while stream_cfg.is_none() {
         match quic::recv_msg::<v1::ControlMessage>(&mut rx, MAX_MESSAGE_LEN).await? {

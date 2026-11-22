@@ -11,6 +11,19 @@ use relay_proto::v1::{self, control_message::Msg};
 use relay_proto::{MAX_MESSAGE_LEN, PROTOCOL_VERSION};
 
 const MAX_AUTH_MSG: usize = 4096;
+/// How long the Host waits for a TOTP code to be typed (FR-36).
+pub const CODE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Asks the person at the Controller for a TOTP code (FR-36). Runs on a
+/// blocking thread: it may read the terminal or the app's pipe.
+#[derive(Clone)]
+pub struct AskCode(pub std::sync::Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>);
+
+impl std::fmt::Debug for AskCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AskCode")
+    }
+}
 
 /// The host refused us (wrong password, declined, locked out, not on the
 /// allow-list). Retrying with the same password cannot help, so the
@@ -68,6 +81,7 @@ pub async fn controller(
     me: &crate::identity::Me,
     device_name: &str,
     password: &str,
+    ask_code: Option<&AskCode>,
 ) -> anyhow::Result<[u8; 32]> {
     let host_key = relay_net::tls::peer_public_key(conn).context("host presented no device key")?;
     let exporter = quic::exporter(conn)?;
@@ -113,7 +127,22 @@ pub async fn controller(
         Err(e) => bail!("authentication failed: {e}"),
     };
     quic::send_msg(tx, &auth_msg(3, ke3)).await?;
-    match quic::recv_msg::<v1::ControlMessage>(rx, MAX_MESSAGE_LEN).await? {
+    let mut reply = quic::recv_msg::<v1::ControlMessage>(rx, MAX_MESSAGE_LEN).await?;
+    // FR-36: the Host wants a TOTP code as well.
+    if let Some(v1::ControlMessage {
+        msg: Some(Msg::Auth(a)),
+    }) = &reply
+        && a.step == 4
+    {
+        let Some(ask) = ask_code.cloned() else {
+            return Err(Refused("this computer also needs a two-factor code".into()).into());
+        };
+        let code = tokio::task::spawn_blocking(move || (ask.0)()).await??;
+        let code: String = code.chars().filter(char::is_ascii_digit).collect();
+        quic::send_msg(tx, &auth_msg(5, code.into_bytes())).await?;
+        reply = quic::recv_msg::<v1::ControlMessage>(rx, MAX_MESSAGE_LEN).await?;
+    }
+    match reply {
         Some(v1::ControlMessage {
             msg: Some(Msg::AuthOutcome(o)),
         }) if o.result == v1::AuthResult::Ok as i32 => Ok(key),
@@ -133,6 +162,7 @@ fn outcome_error(o: &v1::AuthOutcome) -> anyhow::Error {
         ),
         v1::AuthResult::Declined => "the host declined the connection".into(),
         v1::AuthResult::NotWhitelisted => "this device is not allowed to connect".into(),
+        v1::AuthResult::BadCode => "wrong two-factor code".into(),
         other => format!("host refused the connection: {other:?}"),
     };
     Refused(msg).into()
@@ -229,6 +259,21 @@ pub async fn host_login<'a>(
     })
 }
 
+/// Host side, step 3 (FR-36): ask for the TOTP code and return what the
+/// Controller typed. Only called after the password passed.
+pub async fn host_code(tx: &mut SendStream, rx: &mut RecvStream) -> anyhow::Result<String> {
+    quic::send_msg(tx, &auth_msg(4, Vec::new())).await?;
+    let msg = tokio::time::timeout(CODE_WAIT, quic::recv_msg::<v1::ControlMessage>(rx, 64))
+        .await
+        .context("no two-factor code in time")??;
+    match msg {
+        Some(v1::ControlMessage {
+            msg: Some(Msg::Auth(a)),
+        }) if a.step == 5 => Ok(String::from_utf8_lossy(&a.payload).into_owned()),
+        _ => bail!("expected a two-factor code"),
+    }
+}
+
 pub async fn send_outcome(
     tx: &mut SendStream,
     result: v1::AuthResult,
@@ -243,4 +288,118 @@ pub async fn send_outcome(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_crypto::pake::PasswordKind;
+    use relay_crypto::totp::Secret;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const PW: &str = "correct-horse-battery-staple";
+
+    /// Host that wants the permanent password and then a TOTP code; sends
+    /// `Ok` only when both pass.
+    async fn host(secret: Secret) -> (SocketAddr, [u8; 32]) {
+        let me = Arc::new(crate::identity::ephemeral());
+        let (node, _) =
+            quic::node("127.0.0.1:0".parse().unwrap(), &me.tls, Some(&[quic::ALPN])).unwrap();
+        let addr = node.endpoint.local_addr().unwrap();
+        let key = me.public_key();
+        tokio::spawn(async move {
+            let verifier = HostPassword::new(PW, PasswordKind::Permanent).unwrap();
+            let mut last = None;
+            while let Some(i) = node.endpoint.accept().await {
+                let Ok(conn) = i.await else { continue };
+                let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
+                let peer = host_hello(&conn, &mut rx).await.unwrap();
+                let ok = matches!(
+                    host_login(&conn, &mut tx, &mut rx, &me, &peer, |_| Some(&verifier)).await,
+                    Ok(HostAuth::Ok(_))
+                );
+                let result = if !ok {
+                    v1::AuthResult::BadPassword
+                } else {
+                    match host_code(&mut tx, &mut rx).await {
+                        Ok(c) => match secret.verify(&c, crate::unattended::unix_secs(), last) {
+                            Some(step) => {
+                                last = Some(step);
+                                v1::AuthResult::Ok
+                            }
+                            None => v1::AuthResult::BadCode,
+                        },
+                        Err(_) => continue,
+                    }
+                };
+                let _ = send_outcome(&mut tx, result, 0).await;
+                let _ = tx.finish();
+                let _ = conn.closed().await;
+            }
+        });
+        (addr, key)
+    }
+
+    async fn login(
+        addr: SocketAddr,
+        host_key: [u8; 32],
+        ask: Option<AskCode>,
+    ) -> anyhow::Result<[u8; 32]> {
+        let me = crate::identity::ephemeral();
+        let (node, _) = quic::node("127.0.0.1:0".parse().unwrap(), &me.tls, None)?;
+        let (cfg, _) = quic::client_config(
+            &me.tls,
+            relay_net::tls::Expect::Key(host_key),
+            quic::ALPN,
+            Duration::from_secs(2),
+        )?;
+        let conn = quic::connect(&node.endpoint, cfg, addr).await?;
+        let (mut tx, mut rx) = conn.open_bi().await?;
+        let r = controller(&conn, &mut tx, &mut rx, &me, "test", PW, ask.as_ref()).await;
+        conn.close(0u32.into(), b"done");
+        r
+    }
+
+    fn answer(code: String) -> Option<AskCode> {
+        Some(AskCode(Arc::new(move || Ok(code.clone()))))
+    }
+
+    use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn totp_second_factor() {
+        let secret = Secret::generate().unwrap();
+        let (addr, key) = host(secret.clone()).await;
+        let now = crate::unattended::unix_secs();
+        let good = format!("{:06}", secret.code(now / 30));
+        // A code no step in the window produces.
+        let window: Vec<u32> = (now / 30 - 1..=now / 30 + 1)
+            .map(|t| secret.code(t))
+            .collect();
+        let wrong = (0..).find(|c| !window.contains(c)).unwrap();
+        let refused = |r: anyhow::Result<[u8; 32]>| {
+            r.unwrap_err()
+                .downcast::<Refused>()
+                .map(|e| e.0)
+                .unwrap_or_else(|e| format!("not a refusal: {e:#}"))
+        };
+
+        assert_eq!(
+            refused(login(addr, key, None).await),
+            "this computer also needs a two-factor code"
+        );
+        assert_eq!(
+            refused(login(addr, key, answer(format!("{wrong:06}"))).await),
+            "wrong two-factor code"
+        );
+        login(addr, key, answer(good.clone()))
+            .await
+            .expect("password + code accepted");
+        assert_eq!(
+            refused(login(addr, key, answer(good)).await),
+            "wrong two-factor code",
+            "a code works only once"
+        );
+    }
 }

@@ -9,7 +9,8 @@
 //! | Enter | open folder |
 //! | Backspace | parent folder |
 //! | Tab | switch pane |
-//! | F5 | copy to the other pane (upload / download) |
+//! | F5 | copy file or folder to the other pane (upload / download) |
+//! | F6 | when a name is taken: keep both / overwrite / skip (FR-29) |
 //! | F7 | new folder (host) |
 //! | F2 | rename (host) |
 //! | F8 / Delete | delete (host, asks first) |
@@ -26,19 +27,23 @@ use relay_proto::v1;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use crate::files::client::Progress;
+use crate::files::client::{Progress, remote_join};
 
 /// What the window asks the network side to do.
 #[derive(Debug)]
 pub enum FileCmd {
     ListRemote(String),
+    /// A file or a folder (recursive, FR-29).
     Upload {
         local: PathBuf,
         remote_dir: String,
+        conflict: v1::Conflict,
     },
     Download {
         remote: String,
         local_dir: PathBuf,
+        is_dir: bool,
+        conflict: v1::Conflict,
     },
     Op {
         op: v1::FileOp,
@@ -125,6 +130,16 @@ pub struct FileManager {
     prompt: Option<Prompt>,
     transfers: Vec<Transfer>,
     message: String,
+    /// What a copy does when the name is taken (F6).
+    conflict: v1::Conflict,
+}
+
+fn conflict_label(c: v1::Conflict) -> &'static str {
+    match c {
+        v1::Conflict::Rename => "keep both",
+        v1::Conflict::Overwrite => "overwrite",
+        v1::Conflict::Skip => "skip",
+    }
 }
 
 const ROWS: usize = 16;
@@ -167,19 +182,6 @@ fn remote_parent(p: &str) -> String {
     }
 }
 
-fn remote_join(dir: &str, name: &str) -> String {
-    let sep = if dir.contains('\\') && !dir.contains('/') {
-        '\\'
-    } else {
-        '/'
-    };
-    if dir.ends_with(['/', '\\']) {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}{sep}{name}")
-    }
-}
-
 impl FileManager {
     pub fn new() -> Self {
         let mut fm = Self {
@@ -190,12 +192,17 @@ impl FileManager {
             prompt: None,
             transfers: Vec::new(),
             message: String::new(),
+            conflict: v1::Conflict::Rename,
         };
         let start = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         fm.list_local(&start);
         fm
+    }
+
+    pub fn conflict(&self) -> v1::Conflict {
+        self.conflict
     }
 
     /// Host folder that dropped files go to ("" = host's default).
@@ -436,20 +443,32 @@ impl FileManager {
                 }
             }
             KeyCode::F5 => {
-                if let Some(e) = pane.selected().filter(|e| !e.is_dir).cloned() {
+                let conflict = self.conflict;
+                if let Some(e) = pane.selected().filter(|e| e.name != "..").cloned() {
                     match side {
                         Side::Local => out.push(FileCmd::Upload {
                             local: Path::new(&self.local.path).join(&e.name),
                             remote_dir: self.remote.path.clone(),
+                            conflict,
                         }),
                         Side::Remote => out.push(FileCmd::Download {
                             remote: remote_join(&self.remote.path, &e.name),
                             local_dir: PathBuf::from(&self.local.path),
+                            is_dir: e.is_dir,
+                            conflict,
                         }),
                     }
                 } else {
-                    self.message = "select a file (folders are not supported yet)".into();
+                    self.message = "select a file or folder".into();
                 }
+            }
+            KeyCode::F6 => {
+                self.conflict = match self.conflict {
+                    v1::Conflict::Rename => v1::Conflict::Overwrite,
+                    v1::Conflict::Overwrite => v1::Conflict::Skip,
+                    v1::Conflict::Skip => v1::Conflict::Rename,
+                };
+                self.message = format!("if a name is taken: {}", conflict_label(self.conflict));
             }
             KeyCode::F7 if side == Side::Remote => self.prompt = Some(Prompt::Mkdir(String::new())),
             KeyCode::F2 if side == Side::Remote => {
@@ -536,6 +555,7 @@ impl FileManager {
                 .collect();
             let state = match &t.status {
                 None => format!("{} / {}", human(d), human(n)),
+                Some(Ok(to)) if to.starts_with("skipped") => "skipped".into(),
                 Some(Ok(_)) => "done, BLAKE3 verified".into(),
                 Some(Err(e)) => format!("failed: {e}"),
             };
@@ -554,7 +574,10 @@ impl FileManager {
             None if !self.message.is_empty() => out.push(self.message.clone()),
             None => {}
         }
-        out.push("Tab pane  Enter open  Bksp up  F5 copy  F7 mkdir  F2 rename  F8 delete  F9 cancel  Esc close".into());
+        out.push(format!(
+            "Tab pane  Enter open  Bksp up  F5 copy  F6 if taken: {}  F7 mkdir  F2 rename  F8 delete  F9 cancel  Esc close",
+            conflict_label(self.conflict)
+        ));
         out
     }
 }

@@ -102,6 +102,12 @@ fn friendly(raw: &str) -> String {
             .into()
     } else if r.contains("does not own that id") {
         "Warning: the device that answered does not own that ID. Connection refused.".into()
+    } else if r.contains("wrong two-factor code") {
+        "Wrong two-factor code. Use the current code from the authenticator app.".into()
+    } else if r.contains("two-factor code cancelled") {
+        "Connection cancelled.".into()
+    } else if r.contains("needs a two-factor code") {
+        "That computer also needs a two-factor code.".into()
     } else if r.contains("wrong password") {
         "Wrong password.".into()
     } else if r.contains("declined") {
@@ -318,6 +324,22 @@ fn remember(target: &str) {
     save_recent(&r);
 }
 
+/// Answer a viewer's two-factor prompt (FR-36). Empty cancels.
+#[tauri::command]
+fn viewer_code(pid: u32, code: String, state: State<'_, AppState>) -> Result<(), String> {
+    let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    if !code.is_empty() && (code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit())) {
+        return Err("Enter the 6-digit code.".into());
+    }
+    let mut vs = state.viewers.lock().expect("poisoned");
+    let child = vs
+        .iter_mut()
+        .find(|c| c.id() == pid)
+        .ok_or("That connection has ended.")?;
+    let s = child.stdin.as_mut().ok_or("That connection has ended.")?;
+    writeln!(s, "{code}").map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn recent() -> Vec<Recent> {
     load_recent()
@@ -380,18 +402,43 @@ fn connect(
         .args(&args)
         .arg("--password-stdin")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Could not start Relay: {e}"))?;
-    // Password over a pipe, never on the command line.
-    if let Some(mut s) = child.stdin.take() {
+    // Password over a pipe, never on the command line. The pipe stays open:
+    // a two-factor code (FR-36) may be asked for later.
+    if let Some(s) = child.stdin.as_mut() {
         writeln!(s, "{}", password.trim()).map_err(|e| e.to_string())?;
     }
     let tail: Tail = Arc::default();
     drain(child.stderr.take().ok_or("no stderr")?, Some(tail.clone()));
     remember(&label);
     let pid = child.id();
+    {
+        let (app, label) = (app.clone(), label.clone());
+        let out = child.stdout.take().ok_or("no stdout")?;
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let Some(json) = line.strip_prefix(EVENT_PREFIX) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(json) else {
+                    continue;
+                };
+                if v["event"] == "totp_required" {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                    let _ = app.emit(
+                        "viewer",
+                        serde_json::json!({ "state": "code", "target": label, "pid": pid }),
+                    );
+                }
+            }
+        });
+    }
     state.viewers.lock().expect("poisoned").push(child);
     let _ = app.emit(
         "viewer",
@@ -485,11 +532,6 @@ fn set_setting(key: String, value: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn audit_log() -> Result<String, String> {
-    run_relay(&["audit"])
-}
-
-#[tauri::command]
 fn open_privacy_settings(pane: String) {
     #[cfg(target_os = "macos")]
     {
@@ -520,12 +562,12 @@ fn main() {
             stop_host,
             host_cmd,
             connect,
+            viewer_code,
             recent,
             forget_recent,
             rename_device,
             settings,
             set_setting,
-            audit_log,
             open_privacy_settings,
             version,
         ])

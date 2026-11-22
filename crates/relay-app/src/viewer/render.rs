@@ -1102,12 +1102,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => self.end(el),
             WindowEvent::ModifiersChanged(m) => self.input.mods = m.state(),
             // FR-27: drop files on the window to upload them to the host's
-            // current folder (its Downloads until one is opened).
+            // current folder (its Downloads until one is opened). Folders
+            // go too, recursively (FR-29).
             WindowEvent::DroppedFile(path) => {
-                tracing::info!("uploading dropped file {}", path.display());
+                tracing::info!("uploading dropped item {}", path.display());
                 let _ = self.files_tx.send(FileCmd::Upload {
                     local: path,
                     remote_dir: self.files.remote_dir(),
+                    conflict: self.files.conflict(),
                 });
             }
             WindowEvent::Focused(false) => self.input.release_all(),

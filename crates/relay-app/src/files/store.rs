@@ -5,6 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use relay_proto::v1;
+
 /// BLAKE3 of a whole file.
 pub fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut f = File::open(path)?;
@@ -119,9 +121,11 @@ impl Partial {
         Ok(())
     }
 
-    /// Verify the whole file and move it into place under a name that does
-    /// not clobber an existing file (FR-29). Returns the final path.
-    pub fn finish(self) -> Result<PathBuf, String> {
+    /// Verify the whole file and move it into place (FR-29): next to an
+    /// existing file under a free name, or over it with `Overwrite`. A name
+    /// taken since the transfer began is never lost to `Skip`: it keeps both.
+    /// Returns the final path.
+    pub fn finish(self, conflict: v1::Conflict) -> Result<PathBuf, String> {
         self.file.sync_all().map_err(|e| e.to_string())?;
         drop(self.file);
         let got = hash_file(&self.part).map_err(|e| e.to_string())?;
@@ -131,7 +135,16 @@ impl Partial {
             let _ = fs::remove_file(&self.meta);
             return Err("file failed its BLAKE3 check; discarded".into());
         }
-        let dest = unique_name(&self.target);
+        let dest = match conflict {
+            v1::Conflict::Overwrite if self.target.is_dir() => {
+                let _ = fs::remove_file(&self.part);
+                let _ = fs::remove_file(&self.meta);
+                return Err("a folder with that name is in the way".into());
+            }
+            // rename() replaces an existing file on macOS and Windows.
+            v1::Conflict::Overwrite => self.target.clone(),
+            _ => unique_name(&self.target),
+        };
         fs::rename(&self.part, &dest).map_err(|e| e.to_string())?;
         let _ = fs::remove_file(&self.meta);
         Ok(dest)
@@ -219,7 +232,7 @@ mod tests {
             .unwrap();
         p.write_chunk(1, &data[4096..], blake3::hash(&data[4096..]).as_bytes())
             .unwrap();
-        let out = p.finish().unwrap();
+        let out = p.finish(v1::Conflict::Rename).unwrap();
         assert_eq!(fs::read(&out).unwrap(), data);
 
         let mut p = Partial::open(&d.join("y"), 5000, 4096, [1; 32]).unwrap();
@@ -227,11 +240,32 @@ mod tests {
             .unwrap();
         p.write_chunk(1, &data[4096..], blake3::hash(&data[4096..]).as_bytes())
             .unwrap();
-        assert!(p.finish().is_err(), "whole-file hash mismatch");
+        assert!(
+            p.finish(v1::Conflict::Rename).is_err(),
+            "whole-file hash mismatch"
+        );
         assert!(
             !part_paths(&d.join("y")).0.exists(),
             "corrupt partial discarded"
         );
+    }
+
+    #[test]
+    fn overwrite_replaces_rename_keeps_both() {
+        let d = tmp("conflict");
+        let target = d.join("f.txt");
+        fs::write(&target, "old").unwrap();
+        let write = |conflict| {
+            let data = b"new";
+            let mut p = Partial::open(&target, 3, 4096, *blake3::hash(data).as_bytes()).unwrap();
+            p.write_chunk(0, data, blake3::hash(data).as_bytes())
+                .unwrap();
+            p.finish(conflict).unwrap()
+        };
+        assert_eq!(write(v1::Conflict::Rename), d.join("f (1).txt"));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(write(v1::Conflict::Overwrite), target);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
     }
 
     #[test]

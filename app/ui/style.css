@@ -24,7 +24,7 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; background: var(--brand); color: var(--text); }
 body { -webkit-user-select: none; user-select: none; cursor: default; }
-input, output, .mono, .chat-log, .timeline { -webkit-user-select: text; user-select: text; }
+input, output, .mono, .chat-log { -webkit-user-select: text; user-select: text; }
 .sprite { position: absolute; width: 0; height: 0; }
 .ic { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
 .mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
@@ -218,12 +218,6 @@ input:focus { outline: none; border-color: var(--brand-2); box-shadow: 0 0 0 3px
 .session > .hint { margin-top: 10px; text-align: center; }
 
 /* ---------- activity ---------- */
-.timeline { list-style: none; margin: 16px 0 0; padding: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-.timeline li { display: grid; grid-template-columns: 130px 120px 1fr; gap: 14px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); }
-.timeline li:first-child { border-top: 0; }
-.timeline .when { color: var(--text-3); font-size: 12.5px; }
-.timeline .what { font-size: 13.5px; overflow-wrap: anywhere; }
-.timeline .empty-row { display: block; text-align: center; color: var(--text-3); padding: 40px; }
 .tag { justify-self: start; font-size: 11.5px; font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--surface); color: var(--text-2); white-space: nowrap; }
 .tag.start { background: #e6f6ea; color: #1f8a3d; }
 .tag.end { background: var(--brand-soft); color: var(--brand-2); }
@@ -320,3 +314,5 @@ input:focus { outline: none; border-color: var(--brand-2); box-shadow: 0 0 0 3px
   .split { grid-template-columns: 1fr; }
   .col-sep { display: none; }
 }
+
+.head-actions { display: flex; gap: 10px; align-items: center; }
