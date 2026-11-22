@@ -4,7 +4,8 @@
 
 /**
  * @typedef {{ event: string, [k: string]: any }} HostEvent
- * @typedef {{ target: string, last_used: number }} Recent
+ * @typedef {{ target: string, last_used: number, count?: number, name?: string | null }} Recent
+ * @typedef {{ label: string, run: () => unknown }} Action
  * @typedef {{ key: string, value: string, default: boolean }} SettingRow
  * @typedef {{ state: "started" | "ended", target: string, ok?: boolean, message?: string }} ViewerEvent
  */
@@ -105,7 +106,7 @@ function copyText(text) {
 // ---------------------------------------------------------------- tabs
 
 function setupTabs() {
-  const tabs = /** @type {HTMLButtonElement[]} */ ([...document.querySelectorAll('[role="tab"]')]);
+  const tabs = /** @type {HTMLButtonElement[]} */ ([...document.querySelectorAll('.nav-main [role="tab"]')]);
   /** @param {HTMLButtonElement} tab */
   const select = (tab) => {
     for (const x of tabs) {
@@ -115,8 +116,11 @@ function setupTabs() {
       $(x.getAttribute("aria-controls") ?? "").hidden = !on;
     }
     tab.focus();
-    if (tab.id === "tab-activity") loadAudit();
-    if (tab.id === "tab-settings") loadSettings();
+    if (tab.id === "tab-devices") loadRecent();
+    if (tab.id === "tab-settings") {
+      loadSettings();
+      loadAudit();
+    }
   };
   tabs.forEach((tab, i) => {
     tab.addEventListener("click", () => select(tab));
@@ -135,6 +139,7 @@ function setupTabs() {
 const host = {
   /** @type {string | null} */ password: null,
   /** @type {string | null} */ id: null,
+  lanOnly: false,
   /** @type {string | null} */ server: null,
   /** @type {string[]} */ direct: [],
   running: false,
@@ -144,18 +149,24 @@ const host = {
 
 /** @param {"starting" | "ok" | "live" | "off"} kind */
 function setStatus(kind, text) {
-  const pill = $("status-pill");
-  pill.className = `status-pill ${kind === "starting" ? "" : kind}`;
+  $("status-pill").className = `status ${kind === "starting" ? "" : kind}`;
   $("status-text").textContent = text;
 }
 
-function notice(text, action) {
+/**
+ * Message strip under the top bar.
+ * @param {string} text
+ * @param {Action | null} [action]
+ * @param {"info" | "error"} [kind]
+ */
+function notice(text, action = null, kind = "error") {
   const n = $("notice");
+  n.className = `strip ${kind}`;
   $("notice-text").textContent = text;
   const a = $("notice-action");
   a.replaceChildren();
   if (action) {
-    const b = el("button", "btn ghost", action.label);
+    const b = el("button", "link", action.label);
     b.addEventListener("click", action.run);
     a.append(b);
   }
@@ -165,7 +176,6 @@ function notice(text, action) {
 function renderIdle() {
   $("creds").hidden = false;
   $("session").hidden = true;
-  $("ready-badge").hidden = false;
   $("my-pw").textContent = host.password ?? "—";
   $("pw-block").hidden = host.password === null;
 
@@ -174,16 +184,22 @@ function renderIdle() {
   if (host.id) {
     $("id-label").textContent = t("allow.id");
     idEl.textContent = groupId(host.id);
-    idEl.className = "display-num";
-    $("id-hint").textContent = "";
-    $("host-status").textContent = t("allow.ready");
-    setStatus("ok", t("status.online"));
+    idEl.className = "idval";
+    if (host.lanOnly) {
+      $("id-hint").textContent = t("allow.lanOnlyHint");
+      $("host-status").textContent = t("allow.readyLan");
+      setStatus("ok", t("status.lan"));
+    } else {
+      $("id-hint").textContent = "";
+      $("host-status").textContent = t("allow.ready");
+      setStatus("ok", t("status.online"));
+    }
   } else {
     // No ID (no server yet): the first LAN address is the main identifier.
     $("id-label").textContent = t("allow.address");
     const first = others.shift() ?? "—";
     idEl.textContent = first;
-    idEl.className = "display-num small mono";
+    idEl.className = "idval small";
     $("id-hint").textContent = host.server ? t("allow.serverWaiting") : t("allow.noServerHint");
     $("host-status").textContent = t("allow.readyDirect");
     setStatus("ok", t("status.lan"));
@@ -216,6 +232,7 @@ function onHost(ev) {
       break;
     case "id":
       host.id = ev.id;
+      host.lanOnly = Boolean(ev.lan_only);
       if (!host.inSession) renderIdle();
       break;
     case "password":
@@ -231,9 +248,11 @@ function onHost(ev) {
     case "session_start": {
       host.inSession = true;
       host.sessionStart = Date.now();
+      selectSeg("device");
       $("creds").hidden = true;
+      $("direct-block").hidden = true;
+      $("id-hint").textContent = "";
       $("session").hidden = false;
-      $("ready-badge").hidden = true;
       const name = String(ev.name ?? "");
       $("session-who").textContent = name;
       $("session-avatar").textContent = (name.trim()[0] ?? "?").toUpperCase();
@@ -273,6 +292,7 @@ function onHost(ev) {
 }
 
 function permissionNotice() {
+  $("status-warn").hidden = false;
   notice(t("perm.screen"), {
     label: t("perm.open"),
     run: () => invoke("open_privacy_settings", { pane: "screen" }),
@@ -319,57 +339,201 @@ function hideConsent() {
 
 // ---------------------------------------------------------------- connect
 
+/** @type {Recent[]} */
+let devices = [];
+
 async function loadRecent() {
-  /** @type {Recent[]} */
-  const r = await invoke("recent");
-  $("recent").replaceChildren(
-    ...r.map((x) => {
+  devices = await invoke("recent");
+  renderDevices();
+}
+
+function renderDevices() {
+  renderHomeRecent();
+  const q = /** @type {HTMLInputElement} */ ($("device-filter")).value.trim().toLowerCase();
+  const shown = devices.filter(
+    (x) => !q || x.target.includes(q.replace(/\s/g, "")) || x.target.toLowerCase().includes(q) || (x.name ?? "").toLowerCase().includes(q),
+  );
+  const list = $("recent");
+  list.replaceChildren(
+    ...shown.map((x) => {
       const isId = /^\d{9}$/.test(x.target);
+      const shownTarget = isId ? groupId(x.target) : x.target;
       const li = el("li");
       const pick = el("button", "pick");
       const av = el("span", "avatar");
       av.append(icon(isId ? "monitor" : "lan"));
-      const txt = el("span");
-      txt.append(el("div", "t mono", isId ? groupId(x.target) : x.target));
-      txt.append(el("div", "when", `${t(isId ? "control.byId" : "control.byAddress")} · ${ago(x.last_used)}`));
+      const txt = el("span", "grow");
+      const title = el("div", "t");
+      if (x.name) {
+        title.append(document.createTextNode(x.name), el("span", "sub-id mono", shownTarget));
+      } else {
+        title.classList.add("mono");
+        title.textContent = shownTarget;
+      }
+      const n = x.count ?? 1;
+      txt.append(
+        title,
+        el(
+          "div",
+          "when",
+          `${t(isId ? "control.byId" : "control.byAddress")} · ${n === 1 ? t("devices.session1") : t("devices.sessions", { n })} · ${ago(x.last_used)}`,
+        ),
+      );
       pick.append(av, txt);
-      pick.addEventListener("click", () => {
-        /** @type {HTMLInputElement} */ ($("target")).value = isId ? groupId(x.target) : x.target;
-        $("password").focus();
-      });
-      const rm = el("button", "icon-btn rm");
+      pick.addEventListener("click", () => askPassword(shownTarget));
+      const actions = el("span", "actions");
+      const ren = el("button", "icon-btn");
+      ren.append(icon("pencil"));
+      ren.setAttribute("aria-label", t("devices.renameItem", { target: x.name || shownTarget }));
+      ren.title = t("devices.rename");
+      ren.addEventListener("click", () => askRename(x));
+      const rm = el("button", "icon-btn");
       rm.append(icon("x"));
-      rm.setAttribute("aria-label", t("control.forget", { target: x.target }));
+      rm.setAttribute("aria-label", t("control.forget", { target: x.name || shownTarget }));
       rm.title = rm.getAttribute("aria-label") ?? "";
       rm.addEventListener("click", async () => {
         await invoke("forget_recent", { target: x.target });
         loadRecent();
       });
-      li.append(pick, rm);
+      const go = el("button", "btn primary", t("control.connectItem"));
+      go.addEventListener("click", () => askPassword(shownTarget));
+      actions.append(ren, rm, go);
+      li.append(pick, actions);
       return li;
     }),
   );
-  $("recent-block").hidden = r.length === 0;
+  if (devices.length > 0 && shown.length === 0) list.append(el("li", "no-match", t("devices.noMatch")));
+  $("recent-empty").hidden = devices.length > 0;
+  $("filter-wrap").hidden = devices.length < 6;
+}
+
+/** Recent tab on the home page: the five latest, click to connect. */
+function renderHomeRecent() {
+  const list = $("recent-home");
+  list.replaceChildren(
+    ...devices.slice(0, 5).map((x) => {
+      const isId = /^\d{9}$/.test(x.target);
+      const shownTarget = isId ? groupId(x.target) : x.target;
+      const li = el("li");
+      const pick = el("button", "pick");
+      const av = el("span", "avatar");
+      av.append(icon(isId ? "monitor" : "lan"));
+      const txt = el("span", "grow");
+      txt.append(el("div", x.name ? "t" : "t mono", x.name || shownTarget));
+      txt.append(el("div", "when", `${x.name ? shownTarget + " · " : ""}${ago(x.last_used)}`));
+      pick.append(av, txt, el("span", "go", t("control.connectItem")));
+      pick.addEventListener("click", () => askPassword(shownTarget));
+      li.append(pick);
+      return li;
+    }),
+  );
+  $("recent-home-empty").hidden = devices.length > 0;
+}
+
+/** @param {"device" | "recent"} which */
+function selectSeg(which) {
+  for (const k of ["device", "recent"]) {
+    const on = k === which;
+    const b = $(`seg-${k}`);
+    b.setAttribute("aria-selected", String(on));
+    b.tabIndex = on ? 0 : -1;
+    $(`pane-${k}`).hidden = !on;
+  }
+}
+
+function setupSeg() {
+  $("seg-device").addEventListener("click", () => selectSeg("device"));
+  $("seg-recent").addEventListener("click", () => selectSeg("recent"));
+  for (const id of ["seg-device", "seg-recent"]) {
+    $(id).addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        const next = id === "seg-device" ? "recent" : "device";
+        selectSeg(next);
+        $(`seg-${next}`).focus();
+      }
+    });
+  }
+  $("quick-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const target = /** @type {HTMLInputElement} */ ($("quick-target")).value.trim();
+    if (target) askPassword(target);
+  });
+}
+
+/** @type {Recent | null} */
+let renaming = null;
+
+/** @param {Recent} d */
+function askRename(d) {
+  renaming = d;
+  $("rename-target").textContent = /^\d{9}$/.test(d.target) ? groupId(d.target) : d.target;
+  const input = /** @type {HTMLInputElement} */ ($("rename-input"));
+  input.value = d.name ?? "";
+  $("rename-modal").hidden = false;
+  input.focus();
+  input.select();
+}
+
+function setupDevices() {
+  $("device-filter").addEventListener("input", renderDevices);
+  $("rename-cancel").addEventListener("click", () => ($("rename-modal").hidden = true));
+  $("rename-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (renaming) {
+      const name = /** @type {HTMLInputElement} */ ($("rename-input")).value;
+      await invoke("rename_device", { target: renaming.target, name });
+    }
+    $("rename-modal").hidden = true;
+    loadRecent();
+  });
+}
+
+/** Open the password dialog for `target`. */
+function askPassword(target) {
+  /** @type {HTMLInputElement} */ ($("target")).value = target;
+  $("pw-title").textContent = t("control.to", { target });
+  $("connect-msg").textContent = "";
+  const pw = /** @type {HTMLInputElement} */ ($("password"));
+  pw.value = "";
+  pw.type = "password";
+  $("show-pw").setAttribute("aria-pressed", "false");
+  $("pw-modal").hidden = false;
+  pw.focus();
 }
 
 function setupConnect() {
+  const targetEl = /** @type {HTMLInputElement} */ ($("target"));
   const pw = /** @type {HTMLInputElement} */ ($("password"));
   $("show-pw").addEventListener("click", () => {
     const show = pw.type === "password";
     pw.type = show ? "text" : "password";
     $("show-pw").setAttribute("aria-pressed", String(show));
   });
-  $("connect-form").addEventListener("submit", async (e) => {
+  $("connect-form").addEventListener("submit", (e) => {
     e.preventDefault();
-    const target = /** @type {HTMLInputElement} */ ($("target")).value.trim();
+    const target = targetEl.value.trim();
+    if (!target) {
+      targetEl.focus();
+      toast(t("control.needTarget"));
+      return;
+    }
+    askPassword(target);
+  });
+  $("pw-cancel").addEventListener("click", () => ($("pw-modal").hidden = true));
+  $("pw-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const target = targetEl.value.trim();
     const msg = $("connect-msg");
-    const btn = /** @type {HTMLButtonElement} */ ($("connect"));
+    const btn = /** @type {HTMLButtonElement} */ ($("pw-connect"));
     msg.className = "msg";
     btn.disabled = true;
     try {
       await invoke("connect", { target, password: pw.value });
       pw.value = "";
-      msg.textContent = t("control.connecting", { target });
+      $("pw-modal").hidden = true;
+      targetEl.value = "";
+      /** @type {HTMLInputElement} */ ($("quick-target")).value = "";
+      notice(t("control.connecting", { target }), null, "info");
       loadRecent();
     } catch (err) {
       msg.className = "msg error";
@@ -378,15 +542,22 @@ function setupConnect() {
       btn.disabled = false;
     }
   });
+  // ⌘K / Ctrl+K jumps to the connect field.
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      targetEl.focus();
+      targetEl.select();
+    }
+  });
+  $("new-connection").addEventListener("click", () => targetEl.focus());
 }
 
 /** @param {ViewerEvent} ev */
 function onViewer(ev) {
-  const msg = $("connect-msg");
-  if (ev.state === "ended") {
-    msg.className = ev.ok ? "msg" : "msg error";
-    msg.textContent = ev.ok ? t("control.closed", { target: ev.target }) : ev.message ?? "";
-  }
+  if (ev.state !== "ended") return;
+  if (ev.ok) notice(t("control.closed", { target: ev.target }), null, "info");
+  else notice(ev.message ?? "", null, "error");
 }
 
 // ---------------------------------------------------------------- activity
@@ -417,7 +588,7 @@ async function loadAudit() {
     const text = /** @type {string} */ (await invoke("audit_log"));
     const lines = text.split("\n").filter((l) => l.trim() && !l.startsWith("("));
     if (lines.length === 0) {
-      list.replaceChildren(el("li", "empty", t("activity.empty")));
+      list.replaceChildren(el("li", "empty-row", t("activity.empty")));
       return;
     }
     list.replaceChildren(
@@ -433,7 +604,7 @@ async function loadAudit() {
       }),
     );
   } catch (err) {
-    list.replaceChildren(el("li", "empty", String(err)));
+    list.replaceChildren(el("li", "empty-row", String(err)));
   }
 }
 
@@ -527,8 +698,11 @@ async function startHost() {
 async function main() {
   applyStrings();
   $("hotkey").textContent = isMac ? "⌃⌥⇧X" : "Ctrl+Alt+Shift+X";
+  $("kbd-k").textContent = isMac ? "⌘ K" : "Ctrl K";
   setupTabs();
   setupConnect();
+  setupDevices();
+  setupSeg();
   setupSettings();
 
   await listen("host", (e) => onHost(e.payload));
@@ -540,7 +714,6 @@ async function main() {
     hideConsent();
     $("creds").hidden = true;
     $("session").hidden = true;
-    $("ready-badge").hidden = true;
     setStatus("off", t("status.off"));
     const p = e.payload ?? {};
     $("host-status").textContent = t("allow.stopped");
@@ -553,6 +726,8 @@ async function main() {
   $("new-pw").addEventListener("click", () => invoke("host_cmd", { cmd: { cmd: "new_password" } }));
   $("end-session").addEventListener("click", () => invoke("host_cmd", { cmd: { cmd: "end" } }));
   $("refresh-audit").addEventListener("click", loadAudit);
+  $("notice-x").addEventListener("click", () => notice(""));
+  $("status-warn").addEventListener("click", () => invoke("open_privacy_settings", { pane: "screen" }));
   $("consent-accept").addEventListener("click", () => {
     hideConsent();
     invoke("host_cmd", { cmd: { cmd: "accept" } });
@@ -562,7 +737,10 @@ async function main() {
     invoke("host_cmd", { cmd: { cmd: "decline" } });
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("consent").hidden) $("consent-decline").click();
+    if (e.key !== "Escape") return;
+    if (!$("consent").hidden) $("consent-decline").click();
+    else if (!$("pw-modal").hidden) $("pw-modal").hidden = true;
+    else if (!$("rename-modal").hidden) $("rename-modal").hidden = true;
   });
   $("chat-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -573,7 +751,7 @@ async function main() {
     input.value = "";
   });
 
-  $("version").textContent = `Version ${await invoke("version")}`;
+  $("version").textContent = `Relay ${await invoke("version")}`;
   loadRecent();
   startHost();
 }

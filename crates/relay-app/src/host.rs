@@ -227,6 +227,17 @@ async fn serve(
         println!("  Password      {}", creds.otp.as_str());
     }
     let port = node.endpoint.local_addr()?.port();
+    // FR-4: answer "who has this ID?" on the local network, so the ID works
+    // without a rendezvous server there.
+    crate::lan::spawn_responder(me.public_key(), port);
+    if opts.server.is_none() {
+        let id = me.key.device_id(0);
+        println!("  Your ID       {id}  (this network; set a server to connect from anywhere)");
+        crate::ui::emit(
+            "id",
+            serde_json::json!({ "id": id.to_string(), "lan_only": true }),
+        );
+    }
     let mut direct = Vec::new();
     for c in crate::rdv::local_candidates(&node) {
         let ip = c

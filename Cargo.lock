@@ -4960,6 +4960,7 @@ dependencies = [
  "relay-session",
  "rpassword",
  "serde_json",
+ "socket2",
  "softbuffer",
  "tokio",
  "tracing",

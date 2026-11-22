@@ -97,7 +97,12 @@ fn clean(line: &str) -> String {
 /// Short, human message for an engine failure (§16.3).
 fn friendly(raw: &str) -> String {
     let r = raw.to_ascii_lowercase();
-    if r.contains("wrong password") {
+    if r.contains("not on this network") {
+        "That ID isn't on this network. To connect from anywhere, set a Relay server in Settings."
+            .into()
+    } else if r.contains("does not own that id") {
+        "Warning: the device that answered does not own that ID. Connection refused.".into()
+    } else if r.contains("wrong password") {
         "Wrong password.".into()
     } else if r.contains("declined") {
         "The other person declined the connection.".into()
@@ -251,6 +256,21 @@ fn host_cmd(cmd: HostCmd, state: State<'_, AppState>) -> Result<(), String> {
 struct Recent {
     target: String,
     last_used: u64,
+    /// Sessions started to it from here.
+    #[serde(default)]
+    count: u32,
+    /// The user's name for it.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+const MAX_DEVICES: usize = 50;
+
+fn save_recent(r: &[Recent]) {
+    let _ = std::fs::create_dir_all(user_dir());
+    if let Ok(b) = serde_json::to_vec_pretty(r) {
+        let _ = std::fs::write(recent_path(), b);
+    }
 }
 
 fn recent_path() -> PathBuf {
@@ -266,22 +286,23 @@ fn load_recent() -> Vec<Recent> {
 
 fn remember(target: &str) {
     let mut r = load_recent();
-    r.retain(|x| x.target != target);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    r.insert(
-        0,
-        Recent {
+    let mut entry = match r.iter().position(|x| x.target == target) {
+        Some(i) => r.remove(i),
+        None => Recent {
             target: target.into(),
             last_used: now,
+            count: 0,
+            name: None,
         },
-    );
-    r.truncate(10);
-    let _ = std::fs::create_dir_all(user_dir());
-    if let Ok(b) = serde_json::to_vec_pretty(&r) {
-        let _ = std::fs::write(recent_path(), b);
-    }
+    };
+    entry.last_used = now;
+    entry.count = entry.count.saturating_add(1);
+    r.insert(0, entry);
+    r.truncate(MAX_DEVICES);
+    save_recent(&r);
 }
 
 #[tauri::command]
@@ -293,9 +314,18 @@ fn recent() -> Vec<Recent> {
 fn forget_recent(target: String) {
     let mut r = load_recent();
     r.retain(|x| x.target != target);
-    if let Ok(b) = serde_json::to_vec_pretty(&r) {
-        let _ = std::fs::write(recent_path(), b);
+    save_recent(&r);
+}
+
+#[tauri::command]
+fn rename_device(target: String, name: String) {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(48).collect();
+    let name = name.trim();
+    let mut r = load_recent();
+    if let Some(d) = r.iter_mut().find(|x| x.target == target) {
+        d.name = (!name.is_empty()).then(|| name.to_string());
     }
+    save_recent(&r);
 }
 
 /// What the user typed: a 9-digit Device ID (spaces allowed) or an
@@ -479,6 +509,7 @@ fn main() {
             connect,
             recent,
             forget_recent,
+            rename_device,
             settings,
             set_setting,
             audit_log,

@@ -28,6 +28,7 @@ mod host;
 mod host_input;
 mod identity;
 mod input_wire;
+mod lan;
 mod logs;
 mod migrate;
 #[cfg(test)]
@@ -403,9 +404,8 @@ fn main() -> anyhow::Result<()> {
             force_relay,
         } => {
             let id = relay_crypto::DeviceId::parse(&id).context("a Device ID has 9 digits")?;
-            let server = server
-                .resolve()?
-                .context("connecting by ID needs --server and --server-key (or RELAY_SERVER / RELAY_SERVER_KEY)")?;
+            // Without a server, IDs work on the local network (lan.rs).
+            let server = server.resolve()?;
             run_viewer(viewer::Target::Id { id, server }, viewer, force_relay)
         }
         Cmd::View { addr, viewer } => {

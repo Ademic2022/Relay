@@ -161,10 +161,11 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
 pub enum Target {
     /// FR-7: direct IP, no rendezvous.
     Direct(SocketAddr),
-    /// By Device ID through the rendezvous server.
+    /// By Device ID: LAN discovery first, then the rendezvous server if
+    /// one is configured (FR-4).
     Id {
         id: relay_crypto::DeviceId,
-        server: crate::rdv::Server,
+        server: Option<crate::rdv::Server>,
     },
 }
 
@@ -205,26 +206,56 @@ pub async fn establish(
 ) -> anyhow::Result<Established> {
     let (node, control) = quic::node(SocketAddr::from(([0, 0, 0, 0], 0)), &me.tls, None)?;
     let hub = crate::rdv::ControlHub::spawn(control);
-    let (conn, path, relay) = match target {
-        Target::Direct(addr) => {
+    let direct = |addr: SocketAddr| {
+        let endpoint = node.endpoint.clone();
+        async move {
             let (cfg, _) = quic::client_config(
                 &me.tls,
                 relay_net::tls::Expect::AnyRecord,
                 quic::ALPN,
                 Duration::from_secs(2),
             )?;
-            let conn = tokio::time::timeout(
-                Duration::from_secs(5),
-                quic::connect(&node.endpoint, cfg, *addr),
-            )
-            .await
-            .with_context(|| {
-                format!("no answer from {addr} (is `relay host` running and reachable?)")
-            })??;
-            (conn, crate::rdv::Path::Direct, None)
+            let conn =
+                tokio::time::timeout(Duration::from_secs(5), quic::connect(&endpoint, cfg, addr))
+                    .await
+                    .with_context(|| {
+                        format!("no answer from {addr} (is `relay host` running and reachable?)")
+                    })??;
+            anyhow::Ok(conn)
         }
+    };
+    let (conn, path, relay) = match target {
+        Target::Direct(addr) => (direct(*addr).await?, crate::rdv::Path::Direct, None),
         Target::Id { id, server } => {
-            crate::rdv::connect_by_id(&node, &hub, me, server, *id, force_relay).await?
+            // FR-4: same network first (a short look when a server exists).
+            let wait = if server.is_some() { 700 } else { 2_000 };
+            let lan = if force_relay {
+                None
+            } else {
+                crate::lan::find(*id, Duration::from_millis(wait)).await
+            };
+            match (lan, server) {
+                (Some(addr), _) => {
+                    tracing::info!("found {id} on this network at {addr}");
+                    let conn = direct(addr).await?;
+                    // Anyone on the LAN can answer; only the key that owns
+                    // the ID may be connected to.
+                    let key = relay_net::tls::peer_public_key(&conn)
+                        .context("host presented no device key")?;
+                    if !crate::lan::key_matches(&key, *id) {
+                        conn.close(1u32.into(), b"wrong device");
+                        bail!("the device that answered for {id} does not own that ID; refusing");
+                    }
+                    (conn, crate::rdv::Path::Direct, None)
+                }
+                (None, Some(server)) => {
+                    crate::rdv::connect_by_id(&node, &hub, me, server, *id, force_relay).await?
+                }
+                (None, None) => bail!(
+                    "{id} is not on this network. To connect from anywhere, set a Relay server \
+                     (relay config set server … and server_key …)"
+                ),
+            }
         }
     };
     let key = relay_net::tls::peer_public_key(&conn).context("host presented no device key")?;

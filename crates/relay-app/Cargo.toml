@@ -38,6 +38,7 @@ font8x8 = { version = "0.3", default-features = false }
 arboard = { version = "3", default-features = false }
 jiff = "1"
 serde_json = "1"
+socket2 = "0.6"
 blake3.workspace = true
 softbuffer = "0.4"
 

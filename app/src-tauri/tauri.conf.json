@@ -12,14 +12,13 @@
       {
         "label": "main",
         "title": "Relay",
-        "width": 940,
-        "height": 620,
-        "minWidth": 780,
-        "minHeight": 540,
+        "width": 1040,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 600,
         "resizable": true,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "backgroundColor": "#0e1014"
+        "hiddenTitle": true
       }
     ],
     "security": {
