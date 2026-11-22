@@ -29,6 +29,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+      # Network-emulation and monitor-switch tests measure timing; they only
+      # mean something in an optimised build (see netem_tests.rs).
+      - name: timing tests (release)
+        run: cargo test --release -p relay-app netem -- --nocapture
 
   deny:
     name: cargo-deny

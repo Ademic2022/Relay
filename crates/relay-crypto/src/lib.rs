@@ -7,6 +7,7 @@ pub mod device;
 pub mod keystore;
 pub mod pake;
 pub mod password;
+pub mod update;
 
 pub use device::{DeviceId, DeviceKey, PeerPins, PinCheck};
 

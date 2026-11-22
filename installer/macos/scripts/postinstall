@@ -1,0 +1,4 @@
+#!/bin/sh
+# Relay is installed to /usr/local/bin/relay. Unattended access is opt-in:
+# an administrator runs `sudo relay unattended setup` afterwards.
+exit 0

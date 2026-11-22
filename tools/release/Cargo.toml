@@ -1,0 +1,18 @@
+[package]
+name = "relay-release"
+description = "Release tooling: update-signing keys and signed update manifests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+relay-crypto = { workspace = true }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+
+[lints]
+workspace = true

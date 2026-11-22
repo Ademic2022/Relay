@@ -3170,6 +3170,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "ed25519-dalek 3.0.0",
  "font8x8",
  "getrandom 0.4.3",
  "jiff",
@@ -3263,6 +3264,16 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+]
+
+[[package]]
+name = "relay-release"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
+ "relay-crypto",
 ]
 
 [[package]]

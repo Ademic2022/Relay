@@ -36,8 +36,10 @@ mod pins;
 mod rdv;
 mod rt;
 mod sender;
+mod settings;
 mod stdin;
 mod unattended;
+mod update;
 mod viewer;
 
 /// Default port for direct (no-rendezvous) connections.
@@ -73,7 +75,11 @@ struct ServerArgs {
 
 impl ServerArgs {
     fn resolve(&self) -> anyhow::Result<Option<rdv::Server>> {
-        match (&self.server, &self.server_key) {
+        // Flags / env first, then settings.conf (FR-41).
+        let st = settings::Settings::load();
+        let server = self.server.clone().or_else(|| st.get("server"));
+        let key = self.server_key.clone().or_else(|| st.get("server_key"));
+        match (&server, &key) {
             (None, _) => Ok(None),
             (Some(_), None) => {
                 anyhow::bail!("--server needs --server-key (printed by relay-server)")
@@ -105,9 +111,9 @@ struct ViewerArgs {
     /// Do not sync the clipboard with the host (FR-17).
     #[arg(long)]
     no_clipboard: bool,
-    /// Starting quality mode; Ctrl+Alt+Q cycles it in the viewer.
-    #[arg(long, value_enum, default_value_t = Quality::Speed)]
-    quality: Quality,
+    /// Starting quality mode (default from settings); Ctrl+Alt+Q cycles it.
+    #[arg(long, value_enum)]
+    quality: Option<Quality>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -137,6 +143,22 @@ enum UnattendedCmd {
     /// Remove the service and invalidate the permanent password (FR-38).
     Disable,
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    List,
+    Get { key: String },
+    Set { key: String, value: String },
+    Unset { key: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpdateCmd {
+    /// Show whether a newer, correctly signed version is available.
+    Check,
+    /// Download, verify and install it.
+    Apply,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +213,16 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
+    },
+    /// View or change settings (FR-41).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Check for and install updates (FR-42).
+    Update {
+        #[command(subcommand)]
+        cmd: UpdateCmd,
     },
     /// Show this computer's connection audit log (FR-39).
     Audit {
@@ -292,6 +324,25 @@ fn main() -> anyhow::Result<()> {
         Cmd::Service {
             cmd: ServiceCmd::Run,
         } => relay_service::run(&relay_service::current_binary()?).map_err(anyhow::Error::from),
+        Cmd::Config { cmd } => match cmd {
+            ConfigCmd::List => {
+                settings::list();
+                Ok(())
+            }
+            ConfigCmd::Get { key } => {
+                println!(
+                    "{}",
+                    settings::Settings::load().get(&key).unwrap_or_default()
+                );
+                Ok(())
+            }
+            ConfigCmd::Set { key, value } => settings::set(&key, &value),
+            ConfigCmd::Unset { key } => settings::unset(&key),
+        },
+        Cmd::Update { cmd } => match cmd {
+            UpdateCmd::Check => update::check_cli(),
+            UpdateCmd::Apply => update::apply_cli(),
+        },
         Cmd::Audit { .. } => {
             match logs::read_audit() {
                 Ok(t) => print!("{t}"),
@@ -355,6 +406,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyhow::Result<()> {
+    let st = settings::Settings::load();
     let password = match v.password {
         Some(p) => p,
         None => rpassword::prompt_password(format!("Password for {target}: "))?,
@@ -364,13 +416,17 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
         password: password.trim().to_string(),
         force_relay,
         measure: v.measure,
-        cmd_ctrl_swap: !v.no_cmd_ctrl_swap,
+        cmd_ctrl_swap: !v.no_cmd_ctrl_swap && st.flag("cmd_ctrl_swap"),
         translate_chars: v.translate_chars,
-        clipboard: !v.no_clipboard,
-        quality: match v.quality {
-            Quality::Speed => relay_proto::v1::QualityMode::Speed,
-            Quality::Balanced => relay_proto::v1::QualityMode::Balanced,
-            Quality::Quality => relay_proto::v1::QualityMode::Quality,
+        clipboard: !v.no_clipboard && st.flag("clipboard"),
+        quality: match v.quality.or(match st.get("quality").as_deref() {
+            Some("balanced") => Some(Quality::Balanced),
+            Some("quality") => Some(Quality::Quality),
+            _ => None,
+        }) {
+            Some(Quality::Balanced) => relay_proto::v1::QualityMode::Balanced,
+            Some(Quality::Quality) => relay_proto::v1::QualityMode::Quality,
+            _ => relay_proto::v1::QualityMode::Speed,
         },
     })
 }

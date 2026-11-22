@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "tools/latency-bench"]
+members = ["crates/*", "tools/latency-bench", "tools/release"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,125 @@
+name: Release
+
+# Tag vX.Y.Z → macOS .pkg, Windows .msi, relay-server image, signed update
+# manifest. Signing steps run only when their secrets are configured.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RELAY_DEFAULT_SERVER: ${{ vars.RELAY_DEFAULT_SERVER }}
+  RELAY_DEFAULT_SERVER_KEY: ${{ vars.RELAY_DEFAULT_SERVER_KEY }}
+  RELAY_UPDATE_URL: ${{ vars.RELAY_UPDATE_URL }}
+  RELAY_UPDATE_KEY: ${{ vars.RELAY_UPDATE_KEY }}
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    env:
+      # `secrets` cannot appear in step `if:`; expose presence as flags.
+      HAS_CERTS: ${{ secrets.MACOS_CERTS_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.MACOS_NOTARY_APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Import signing certificates
+        if: env.HAS_CERTS == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERTS_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTS_PASSWORD }}
+        run: |
+          echo "$P12" | base64 --decode > certs.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import certs.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+      - name: Notary credentials
+        if: env.HAS_NOTARY == 'true'
+        run: |
+          xcrun notarytool store-credentials relay-notary \
+            --apple-id "${{ secrets.MACOS_NOTARY_APPLE_ID }}" \
+            --team-id "${{ secrets.MACOS_NOTARY_TEAM_ID }}" \
+            --password "${{ secrets.MACOS_NOTARY_PASSWORD }}"
+          echo "MACOS_NOTARY_PROFILE=relay-notary" >> "$GITHUB_ENV"
+      - name: Build package
+        env:
+          UNIVERSAL: "1"
+          MACOS_APP_SIGN_ID: ${{ vars.MACOS_APP_SIGN_ID }}
+          MACOS_INSTALLER_SIGN_ID: ${{ vars.MACOS_INSTALLER_SIGN_ID }}
+        run: ./installer/macos/build-pkg.sh
+      - name: Update artifacts
+        run: |
+          mkdir -p dist
+          cp target/installer/macos/*.pkg dist/
+          cp target/installer/macos/root/usr/local/bin/relay dist/relay-macos-aarch64
+          cp target/installer/macos/root/usr/local/bin/relay dist/relay-macos-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    env:
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: WiX
+        run: |
+          dotnet tool install --global wix
+          wix extension add -g WixToolset.Firewall.wixext
+      - name: Import signing certificate
+        if: env.HAS_CERT == 'true'
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_PFX }}"))
+          $c = Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My `
+                 -Password (ConvertTo-SecureString "${{ secrets.WINDOWS_CERT_PASSWORD }}" -AsPlainText -Force)
+          "WINDOWS_SIGN_THUMBPRINT=$($c.Thumbprint)" | Out-File -Append $env:GITHUB_ENV
+      - name: Build MSI
+        shell: pwsh
+        run: ./installer/windows/build.ps1
+      - name: Update artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/installer/windows/*.msi dist/
+          Copy-Item target/release/relay.exe dist/relay-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    env:
+      HAS_UPDATE_KEY: ${{ secrets.RELAY_UPDATE_SIGNING_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Signed update manifest (FR-42)
+        if: env.HAS_UPDATE_KEY == 'true'
+        env:
+          KEY: ${{ secrets.RELAY_UPDATE_SIGNING_KEY }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cargo run --release -p relay-release -- manifest "$V" "$RELAY_UPDATE_URL" \
+            macos-aarch64=dist/relay-macos-aarch64 \
+            macos-x86_64=dist/relay-macos-x86_64 \
+            windows-x86_64=dist/relay-windows-x86_64.exe > dist/manifest
+          echo "$KEY" > key.txt
+          cargo run --release -p relay-release -- sign key.txt dist/manifest > dist/manifest.sig
+          rm key.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

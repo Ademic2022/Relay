@@ -44,6 +44,7 @@ softbuffer = "0.4"
 windows = { workspace = true }
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 relay-server = { path = "../relay-server" }
 
 [lints]

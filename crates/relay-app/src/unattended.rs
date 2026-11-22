@@ -38,7 +38,11 @@ pub fn system_dir() -> PathBuf {
 }
 
 fn config_path() -> PathBuf {
-    system_dir().join("unattended.conf")
+    config_path_in(&system_dir())
+}
+
+fn config_path_in(dir: &Path) -> PathBuf {
+    dir.join("unattended.conf")
 }
 
 /// Keystore for the agent's device key.
@@ -71,7 +75,11 @@ impl Config {
 }
 
 pub fn load() -> anyhow::Result<Option<Config>> {
-    let text = match std::fs::read(config_path()) {
+    load_from(&system_dir())
+}
+
+fn load_from(dir: &Path) -> anyhow::Result<Option<Config>> {
+    let text = match std::fs::read(config_path_in(dir)) {
         Ok(b) => {
             let b = keystore_open(&b)?;
             String::from_utf8(b).context("unattended.conf is corrupt")?
@@ -123,6 +131,10 @@ fn keystore_open(b: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 pub fn save(password: &str, allow: &[u32]) -> anyhow::Result<()> {
+    save_to(&system_dir(), password, allow)
+}
+
+fn save_to(dir: &Path, password: &str, allow: &[u32]) -> anyhow::Result<()> {
     if !relay_crypto::password::permanent_acceptable(password) {
         bail!(
             "password too weak: at least {} characters, mixed",
@@ -139,7 +151,7 @@ pub fn save(password: &str, allow: &[u32]) -> anyhow::Result<()> {
             .join(","),
         relay_net::hex(&v.to_bytes())
     );
-    write_private(&config_path(), &keystore_seal(text.as_bytes())?)
+    write_private(&config_path_in(dir), &keystore_seal(text.as_bytes())?)
 }
 
 fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
@@ -168,7 +180,11 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 
 /// FR-38: the permanent password stops working immediately.
 pub fn remove() -> anyhow::Result<()> {
-    match std::fs::remove_file(config_path()) {
+    remove_in(&system_dir())
+}
+
+fn remove_in(dir: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(config_path_in(dir)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -335,18 +351,21 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(unsafe_code)] // test-only env override; no other test reads it
     fn save_load_remove() {
+        // Its own folder: no process-wide environment changes, so it cannot
+        // race other tests.
         let d = std::env::temp_dir().join(format!("relay-unattended-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        // SAFETY of env mutation: this test alone uses RELAY_SYSTEM_DIR.
-        unsafe { std::env::set_var("RELAY_SYSTEM_DIR", &d) };
-        assert!(load().unwrap().is_none());
-        assert!(save("short", &[]).is_err(), "weak passwords refused");
-        save("correct-horse-battery-staple", &[123_456_789]).unwrap();
-        let text = std::fs::read_to_string(config_path()).unwrap();
-        assert!(!text.contains("correct-horse"), "no plaintext password");
-        let c = load().unwrap().unwrap();
+        assert!(load_from(&d).unwrap().is_none());
+        assert!(save_to(&d, "short", &[]).is_err(), "weak passwords refused");
+        save_to(&d, "correct-horse-battery-staple", &[123_456_789]).unwrap();
+        // Bytes, not text: on Windows the file is DPAPI-sealed binary.
+        let raw = std::fs::read(config_path_in(&d)).unwrap();
+        assert!(
+            !raw.windows(13).any(|w| w == b"correct-horse"),
+            "no plaintext password"
+        );
+        let c = load_from(&d).unwrap().unwrap();
         assert_eq!(c.allow, vec![123_456_789]);
         assert!(c.allows(relay_crypto::DeviceId::from_u32(123_456_789)));
         assert!(!c.allows(relay_crypto::DeviceId::from_u32(987_654_321)));
@@ -354,7 +373,7 @@ mod tests {
             !c.allows(None),
             "unregistered controllers are not on the list"
         );
-        remove().unwrap();
-        assert!(!enabled());
+        remove_in(&d).unwrap();
+        assert!(!config_path_in(&d).exists());
     }
 }

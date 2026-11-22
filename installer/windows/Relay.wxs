@@ -1,0 +1,42 @@
+<!--
+  Relay MSI (WiX Toolset v4+), per-machine (PRD §10 Windows).
+
+  Build: installer/windows/build.ps1
+  - installs relay.exe to "C:\Program Files\Relay"
+  - adds it to the system PATH
+  - opens Windows Firewall for relay.exe (UDP, for QUIC and hole punching)
+  - on uninstall, removes unattended access first (service + permanent
+    password, FR-38) if it was set up
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <Package Name="Relay" Manufacturer="Relay" Version="$(var.Version)"
+           UpgradeCode="6B7C0E2A-6A5E-4C1F-9B8D-3E2F1A7C5D41" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Relay is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Relay">
+        <Component Id="RelayExe" Guid="D2A5E6B1-3C4F-4E8A-9B7D-1F2E3A4B5C6D">
+          <File Id="RelayExeFile" Source="$(var.RelayExe)" KeyPath="yes">
+            <fw:FirewallException Id="RelayFirewall" Name="Relay" Protocol="udp" Scope="any" Profile="all" />
+          </File>
+          <Environment Id="RelayPath" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+                       Action="set" System="yes" Permanent="no" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- FR-38: uninstall removes the service and invalidates the password. -->
+    <CustomAction Id="DisableUnattended" FileRef="RelayExeFile"
+                  ExeCommand="unattended disable" Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="DisableUnattended" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="Relay">
+      <ComponentRef Id="RelayExe" />
+    </Feature>
+  </Package>
+</Wix>

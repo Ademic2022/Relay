@@ -18,7 +18,7 @@ Built milestone by milestone (PRD §12).
 | M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
 | M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders not yet |
 | M7 Unattended access | permanent password + allow-list, agent mode, banner window, audit + diagnostic logs, reboot/safe mode/Ctrl+Alt+Del, auto-reconnect, Windows service + macOS launchd supervisor; tested locally without installing the service; reboot/login-screen acceptance needs real machines |
-| M8 Ship | not started |
+| M8 Ship | settings (`relay config`), signed auto-update, macOS .pkg + Windows MSI scripts, release workflow, docs; unsigned builds only so far (no certificates), MSI not built here, Tauri UI not started |
 
 ## Layout
 
@@ -36,6 +36,7 @@ Built milestone by milestone (PRD §12).
 | `relay-server` | rendezvous (Device IDs, lookup, punch coordination) + blind UDP relay; Dockerfile |
 | `relay-app` | `relay` binary: M1 host (capture → encode → QUIC datagrams) and wgpu viewer |
 | `tools/latency-bench` | latency percentiles and release regression gate |
+| `tools/release` | `relay-release`: update-signing keys and signed manifests |
 
 ## Try it
 
@@ -131,6 +132,19 @@ viewer, `Ctrl+Alt+R` twice restarts the host (`Ctrl+Alt+Shift+R`: Safe Mode, Win
 
 Every connection is recorded: `relay audit` (`--unattended` for the agent's log).
 Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
+
+## Settings, updates, installers (M8)
+
+- `relay config list | get KEY | set KEY VALUE | unset KEY`: server, server_key, quality,
+  clipboard, cmd_ctrl_swap, start_with_os, language, update_url (FR-41).
+- `relay update check | apply`: Ed25519-signed manifests, BLAKE3-checked downloads, no
+  downgrades (FR-42). Release keys: `cargo run -p relay-release -- keygen`.
+- Installers: `installer/macos/build-pkg.sh` (.pkg; signs and notarises when the
+  `MACOS_*` variables are set) and `installer/windows/build.ps1` (WiX MSI; signs with
+  `WINDOWS_SIGN_THUMBPRINT`). Both enforce the 25 MB limit. Tagging `vX.Y.Z` runs
+  `.github/workflows/release.yml`.
+- Docs: [docs/install.md](docs/install.md), [docs/self-hosting.md](docs/self-hosting.md),
+  [docs/release.md](docs/release.md).
 
 ## Network-emulation tests (M4)
 
