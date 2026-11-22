@@ -73,6 +73,26 @@ pub fn local_os() -> v1::OsKind {
     }
 }
 
+/// What the Controller logs in with.
+#[derive(Debug, Clone, Copy)]
+pub struct Login<'a> {
+    pub password: &'a str,
+    /// Asked if the Host wants a two-factor code (FR-36).
+    pub ask_code: Option<&'a AskCode>,
+    /// Non-empty: a wake request, not a session (FR-37).
+    pub wake_macs: &'a [crate::wol::Mac],
+}
+
+impl<'a> Login<'a> {
+    pub fn password(password: &'a str) -> Self {
+        Self {
+            password,
+            ask_code: None,
+            wake_macs: &[],
+        }
+    }
+}
+
 /// Controller side. Returns the session key on success.
 pub async fn controller(
     conn: &Connection,
@@ -80,9 +100,13 @@ pub async fn controller(
     rx: &mut RecvStream,
     me: &crate::identity::Me,
     device_name: &str,
-    password: &str,
-    ask_code: Option<&AskCode>,
+    login: Login<'_>,
 ) -> anyhow::Result<[u8; 32]> {
+    let Login {
+        password,
+        ask_code,
+        wake_macs,
+    } = login;
     let host_key = relay_net::tls::peer_public_key(conn).context("host presented no device key")?;
     let exporter = quic::exporter(conn)?;
     let my_key = me.public_key();
@@ -98,10 +122,11 @@ pub async fn controller(
                 decoders: vec![v1::Codec::H264 as i32],
                 ..Default::default()
             }),
+            wake_macs: wake_macs.iter().map(|m| m.to_vec().into()).collect(),
         })),
     )
     .await?;
-    let (login, ke1) = ControllerLogin::start(password)?;
+    let (pake, ke1) = ControllerLogin::start(password)?;
     quic::send_msg(tx, &auth_msg_kind(1, ke1, kind_of(password))).await?;
 
     let ke2 = match quic::recv_msg::<v1::ControlMessage>(rx, MAX_MESSAGE_LEN).await? {
@@ -117,7 +142,7 @@ pub async fn controller(
         controller_pubkey: &my_key,
         host_pubkey: &host_key,
     };
-    let (ke3, key) = match login.finish(password, &ke2, parties, &exporter) {
+    let (ke3, key) = match pake.finish(password, &ke2, parties, &exporter) {
         Ok(v) => v,
         Err(PakeError::BadPassword) => {
             // Tell the host so it counts the failure (FR-35).
@@ -174,6 +199,8 @@ pub struct Peer {
     pub key: [u8; 32],
     pub id: Option<relay_crypto::DeviceId>,
     pub name: String,
+    /// A wake-only request (FR-37): acted on only after authentication.
+    pub wake_macs: Vec<crate::wol::Mac>,
 }
 
 /// Host side, step 1: read `Hello` and check it matches the TLS identity.
@@ -205,6 +232,7 @@ pub async fn host_hello(conn: &Connection, rx: &mut RecvStream) -> anyhow::Resul
         key: tls_key,
         id,
         name,
+        wake_macs: crate::wol::from_wire(&hello.wake_macs),
     })
 }
 
@@ -356,7 +384,11 @@ mod tests {
         )?;
         let conn = quic::connect(&node.endpoint, cfg, addr).await?;
         let (mut tx, mut rx) = conn.open_bi().await?;
-        let r = controller(&conn, &mut tx, &mut rx, &me, "test", PW, ask.as_ref()).await;
+        let login = Login {
+            ask_code: ask.as_ref(),
+            ..Login::password(PW)
+        };
+        let r = controller(&conn, &mut tx, &mut rx, &me, "test", login).await;
         conn.close(0u32.into(), b"done");
         r
     }

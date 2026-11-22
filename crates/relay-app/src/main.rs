@@ -43,6 +43,7 @@ mod ui;
 mod unattended;
 mod update;
 mod viewer;
+mod wol;
 
 /// Default port for direct (no-rendezvous) connections.
 pub const DIRECT_PORT: u16 = 21118;
@@ -263,6 +264,28 @@ enum Cmd {
         #[arg(long)]
         force_relay: bool,
     },
+    /// Wake a sleeping computer through another Relay device on its
+    /// network (FR-37). That device needs unattended access; you log in
+    /// with its permanent password.
+    Wake {
+        /// The computer to wake: its Device ID or address, as you
+        /// connected to it before (its MAC was remembered then).
+        device: String,
+        /// A Relay device on the same network that is awake.
+        #[arg(long, value_name = "ID_OR_ADDRESS")]
+        via: String,
+        /// MAC address to wake instead of the remembered ones (repeatable).
+        #[arg(long = "mac", value_name = "AA:BB:CC:DD:EE:FF")]
+        macs: Vec<String>,
+        /// Read the password from the first line of stdin.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Two-factor code for the --via device, if it asks (FR-36).
+        #[arg(long, value_name = "CODE")]
+        totp: Option<String>,
+        #[command(flatten)]
+        server: ServerArgs,
+    },
     /// Connect directly to a host's IP address (no server; FR-7).
     View {
         /// Host address, e.g. 192.168.1.20 (port defaults to 21118).
@@ -417,6 +440,51 @@ fn main() -> anyhow::Result<()> {
             let server = server.resolve()?;
             run_viewer(viewer::Target::Id { id, server }, viewer, force_relay)
         }
+        Cmd::Wake {
+            device,
+            via,
+            macs,
+            password_stdin,
+            totp,
+            server,
+        } => {
+            let server = server.resolve()?;
+            let device = parse_target(&device, server)?;
+            let macs: Vec<wol::Mac> = if macs.is_empty() {
+                wol::known(&device.pin_name())
+            } else {
+                macs.iter()
+                    .map(|m| wol::parse(m).with_context(|| format!("not a MAC address: {m}")))
+                    .collect::<anyhow::Result<_>>()?
+            };
+            if macs.is_empty() {
+                anyhow::bail!(
+                    "no MAC address known for {device}: connect to it once while it is awake, \
+                     or pass --mac"
+                );
+            }
+            let via = parse_target(&via, server)?;
+            let password = if password_stdin {
+                let mut l = String::new();
+                std::io::stdin().read_line(&mut l)?;
+                l
+            } else {
+                rpassword::prompt_password(format!("Permanent password for {via}: "))?
+            };
+            let ask = ask_code(totp, password_stdin, via.to_string());
+            let n = tokio::runtime::Runtime::new()?.block_on(wol::wake_via(
+                &via,
+                password.trim(),
+                ask,
+                &macs,
+            ))?;
+            println!(
+                "{via} sent {n} magic packets for {device} ({}). It should be online in a minute \
+                 if Wake-on-LAN is enabled in its firmware and network settings.",
+                macs.iter().map(wol::format).collect::<Vec<_>>().join(", ")
+            );
+            Ok(())
+        }
         Cmd::View { addr, viewer } => {
             run_viewer(viewer::Target::Direct(parse_addr(&addr)?), viewer, false)
         }
@@ -460,6 +528,14 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
             _ => relay_proto::v1::QualityMode::Speed,
         },
     })
+}
+
+/// A Device ID ("123 456 789") or an address.
+fn parse_target(s: &str, server: Option<rdv::Server>) -> anyhow::Result<viewer::Target> {
+    match relay_crypto::DeviceId::parse(s) {
+        Some(id) => Ok(viewer::Target::Id { id, server }),
+        None => Ok(viewer::Target::Direct(parse_addr(s)?)),
+    }
 }
 
 /// FR-36: a `--totp` code is used once; after that (a reconnect needs a

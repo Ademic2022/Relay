@@ -145,6 +145,20 @@ can end any session with the banner's **End session** button or the global hotke
 viewer, `Ctrl+Alt+R` twice restarts the host (`Ctrl+Alt+Shift+R`: Safe Mode, Windows) and
 `Ctrl+Alt+End` sends Ctrl+Alt+Del; the viewer shows "Waiting for device…" and reconnects.
 
+**Wake-on-LAN through another device (FR-37).** Each time you connect to a host, the viewer
+remembers its MAC addresses. If it is asleep later, ask another Relay device on the same network
+(one with unattended access) to wake it:
+
+```sh
+relay wake "123 456 789" --via "987 654 321"     # log in with the --via device's permanent password
+relay wake 192.168.1.20 --via 192.168.1.5 --mac 00:11:22:aa:bb:cc
+```
+
+The `--via` device checks the password (and two-factor code, allow-list) first, broadcasts the
+magic packets, records `WAKE …` in its audit log, and starts no session. Hosts without
+unattended access refuse wake requests. Wake-on-LAN must be enabled in the sleeping computer's
+firmware/network settings (on a Mac: System Settings → Energy → "Wake for network access").
+
 Every connection is recorded: `relay audit` (`--unattended` for the agent's log).
 Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
 

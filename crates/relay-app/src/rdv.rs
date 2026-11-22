@@ -591,7 +591,15 @@ mod tests {
         let (conn, mut path, exp) =
             connect_by_id(&node, &hub, &me, &w.server, w.host_id, force_relay).await?;
         let (mut tx, mut rx) = conn.open_bi().await?;
-        auth::controller(&conn, &mut tx, &mut rx, &me, "test", password, None).await?;
+        auth::controller(
+            &conn,
+            &mut tx,
+            &mut rx,
+            &me,
+            "test",
+            auth::Login::password(password),
+        )
+        .await?;
         if let Some(exp) = exp {
             // Relay → P2P switch (FR-4).
             let exporter = crate::migrate::exporter(&conn)?;
@@ -673,9 +681,16 @@ mod tests {
             .unwrap();
         assert_eq!(path, Path::Relay);
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
-        auth::controller(&conn, &mut tx, &mut rx, &me, "test", "Pw3dEf7h", None)
-            .await
-            .unwrap();
+        auth::controller(
+            &conn,
+            &mut tx,
+            &mut rx,
+            &me,
+            "test",
+            auth::Login::password("Pw3dEf7h"),
+        )
+        .await
+        .unwrap();
         let mut s = conn.open_uni().await.unwrap();
         s.write_all(MARKER).await.unwrap();
         s.finish().unwrap();

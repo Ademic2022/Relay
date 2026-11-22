@@ -540,8 +540,10 @@ async fn network(
         &mut rx,
         &me,
         &name,
-        &password,
-        ask_code.as_ref(),
+        crate::auth::Login {
+            ask_code: ask_code.as_ref(),
+            ..crate::auth::Login::password(&password)
+        },
     )
     .await?;
     let mut stream_cfg = None;
@@ -579,6 +581,10 @@ async fn network(
             Some(v1::ControlMessage {
                 msg: Some(Msg::Monitors(m)),
             }) => *shared.displays.lock().expect("poisoned") = m.displays,
+            // FR-37: remember how to wake this host later.
+            Some(v1::ControlMessage {
+                msg: Some(Msg::HostDetails(d)),
+            }) => crate::wol::remember(&target.pin_name(), &crate::wol::from_wire(&d.macs)),
             Some(v1::ControlMessage {
                 msg: Some(Msg::SelectMonitor(sel)),
             }) => shared

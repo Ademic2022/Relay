@@ -482,6 +482,44 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         return reject(&mut tx, v1::AuthResult::NotWhitelisted, 0).await;
     }
 
+    // FR-37: a wake request, not a session. Only for unattended logins
+    // (the owner's own devices); nothing on screen, no session.
+    if !peer.wake_macs.is_empty() {
+        if !unattended {
+            audit(&format!(
+                "REFUSED wake request from {name}: needs unattended access"
+            ));
+            return reject(&mut tx, v1::AuthResult::Declined, 0).await;
+        }
+        let macs = peer.wake_macs.clone();
+        let r = tokio::task::spawn_blocking(move || crate::wol::send(&macs)).await?;
+        audit(&format!(
+            "WAKE {} requested by {name}: {}",
+            peer.wake_macs
+                .iter()
+                .map(crate::wol::format)
+                .collect::<Vec<_>>()
+                .join(", "),
+            match &r {
+                Ok(n) => format!("{n} magic packets sent"),
+                Err(e) => format!("failed: {e}"),
+            }
+        ));
+        auth::send_outcome(&mut tx, v1::AuthResult::Ok, 0).await?;
+        quic::send_msg(
+            &mut tx,
+            &control(Msg::WakeResult(v1::WakeResult {
+                packets_sent: *r.as_ref().unwrap_or(&0),
+                error: r.err().map(|e| e.to_string()).unwrap_or_default(),
+            })),
+        )
+        .await?;
+        let _ = tx.finish();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        conn.close(0u32.into(), b"wake sent");
+        return Ok(SessionOutcome::Rejected);
+    }
+
     // One session (and one consent dialog) at a time.
     let Ok(_streaming) = st.streaming.try_lock() else {
         println!("  ○ {name} tried to connect while another session is active.");
@@ -660,6 +698,17 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         &mut tx,
         &control(Msg::SelectMonitor(v1::SelectMonitor {
             display_id: display.id,
+        })),
+    )
+    .await?;
+    // FR-37: so the Controller can wake this computer later.
+    quic::send_msg(
+        &mut tx,
+        &control(Msg::HostDetails(v1::HostDetails {
+            macs: crate::wol::local_macs()
+                .iter()
+                .map(|m| m.to_vec().into())
+                .collect(),
         })),
     )
     .await?;

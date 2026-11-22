@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
 # Terminal QR code for TOTP enrolment (FR-36).
 qrcode = { version = "0.14", default-features = false }
+# This host's MAC addresses, for Wake-on-LAN (FR-37).
+mac_address = "1.1"
 getrandom.workspace = true
 quinn.workspace = true
 tokio = { workspace = true, features = ["signal", "process", "io-std", "io-util"] }

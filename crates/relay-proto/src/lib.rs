@@ -79,6 +79,7 @@ mod tests {
                     decoders: vec![Codec::H264 as i32],
                     ..Default::default()
                 }),
+                wake_macs: vec![vec![0, 0x11, 0x22, 0xaa, 0xbb, 0xcc].into()],
             })),
         };
         let wire = encode_delimited(&msg);

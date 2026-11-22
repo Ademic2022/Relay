@@ -17,7 +17,7 @@ fn path() -> Option<PathBuf> {
 }
 
 /// Per-user configuration directory.
-fn config_dir() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     let env = |k: &str| {
         std::env::var_os(k)
             .filter(|v| !v.is_empty())

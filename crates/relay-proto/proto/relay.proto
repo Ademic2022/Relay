@@ -39,6 +39,10 @@ message Hello {
   string device_name = 4;
   OsKind os = 5;
   Capabilities capabilities = 6;
+  // Wake-on-LAN through this Host (FR-37): not a session. The Host sends
+  // magic packets for these MACs (6 bytes each) after the password passes,
+  // answers WakeResult and closes. Empty = a normal session.
+  repeated bytes wake_macs = 7;
 }
 
 // Opaque PAKE (OPAQUE) messages; contents defined by relay-crypto.
@@ -179,7 +183,20 @@ message ControlMessage {
     SendSas send_sas = 13;
     PathSwitch path_switch = 14;
     PathSwitched path_switched = 15;
+    HostDetails host_details = 16;
+    WakeResult wake_result = 17;
   }
+}
+
+// Host → Controller once per session: what the Controller needs to wake
+// this Host later through another device on its LAN (FR-37).
+message HostDetails {
+  repeated bytes macs = 1;      // 6 bytes each, wired first
+}
+
+message WakeResult {
+  uint32 packets_sent = 1;
+  string error = 2;
 }
 
 // ---------------------------------------------------------------- input
