@@ -557,6 +557,15 @@ fn version() -> String {
 fn main() {
     let app = tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|_app| {
+            // Windows draws its own title bar (our dark one is macOS-only,
+            // see index.html): make it dark to match.
+            #[cfg(windows)]
+            if let Some(w) = _app.get_webview_window("main") {
+                let _ = w.set_theme(Some(tauri::Theme::Dark));
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_host,
             stop_host,

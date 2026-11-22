@@ -20,6 +20,9 @@ const listen = T.event.listen;
 /** @type {Record<string, string>} */
 const S = /** @type {any} */ (window).RELAY_STRINGS;
 const isMac = navigator.userAgent.includes("Mac");
+// macOS: our own dark title bar under the traffic lights. Elsewhere the
+// OS draws the title bar, so ours is hidden (style.css).
+document.documentElement.dataset.os = isMac ? "mac" : "other";
 
 /** Look up a string and fill `{name}` placeholders. */
 function t(key, vars = {}) {

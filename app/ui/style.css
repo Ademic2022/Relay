@@ -39,6 +39,15 @@ input, output, .mono, .chat-log { -webkit-user-select: text; user-select: text; 
   border-bottom: 1px solid #1a1a1d;
 }
 .shell { display: grid; grid-template-columns: 232px 1fr; height: calc(100vh - 32px); }
+/* Windows: the OS title bar is enough. */
+:root:not([data-os="mac"]) .titlebar { display: none; }
+:root:not([data-os="mac"]) .shell { height: 100vh; }
+
+/* Slim scrollbars (WebView2 draws wide classic ones by default). */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
 
 /* ---------- sidebar ---------- */
 .sidebar { background: var(--brand); color: #fff; display: flex; flex-direction: column; padding: 14px 8px 12px; }
