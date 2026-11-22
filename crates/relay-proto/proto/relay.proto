@@ -1,0 +1,310 @@
+// Relay wire protocol, version 1.
+//
+// Every reliable stream carries length-delimited messages from this file.
+// Video slices are NOT protobuf: they travel as QUIC datagrams with a fixed
+// binary header (see relay-net::video) to keep per-packet overhead minimal.
+//
+// Compatibility rules: never reuse or renumber a field; add new fields only;
+// bump PROTOCOL_VERSION in relay-proto/src/lib.rs on breaking change.
+syntax = "proto3";
+
+package relay.v1;
+
+// ---------------------------------------------------------------- handshake
+
+enum Codec {
+  CODEC_UNSPECIFIED = 0;
+  CODEC_H264 = 1;
+  CODEC_HEVC = 2;
+}
+
+enum OsKind {
+  OS_KIND_UNSPECIFIED = 0;
+  OS_KIND_WINDOWS = 1;
+  OS_KIND_MACOS = 2;
+}
+
+message Capabilities {
+  repeated Codec decoders = 1;
+  repeated Codec encoders = 2;
+  bool hevc_444 = 3;
+  bool multi_stream = 4;
+  bool intra_refresh = 5;
+}
+
+message Hello {
+  uint32 protocol_version = 1;
+  bytes device_pubkey = 2;      // Ed25519, 32 bytes
+  uint32 device_id = 3;         // 9-digit ID
+  string device_name = 4;
+  OsKind os = 5;
+  Capabilities capabilities = 6;
+}
+
+// Opaque PAKE (OPAQUE) messages; contents defined by relay-crypto.
+message AuthMessage {
+  uint32 step = 1;
+  bytes payload = 2;
+}
+
+enum AuthResult {
+  AUTH_RESULT_UNSPECIFIED = 0;
+  AUTH_RESULT_OK = 1;
+  AUTH_RESULT_BAD_PASSWORD = 2;
+  AUTH_RESULT_LOCKED_OUT = 3;   // FR-35
+  AUTH_RESULT_NOT_WHITELISTED = 4;
+  AUTH_RESULT_DECLINED = 5;     // Host user clicked Decline / timed out (FR-8)
+}
+
+message AuthOutcome {
+  AuthResult result = 1;
+  uint32 retry_after_ms = 2;
+}
+
+// ---------------------------------------------------------------- session control
+
+message Permissions {
+  bool view = 1;
+  bool control = 2;
+  bool clipboard = 3;
+  bool file_transfer = 4;
+}
+
+message Display {
+  uint32 id = 1;
+  string name = 2;
+  int32 x = 3;                  // virtual-desktop position, physical pixels
+  int32 y = 4;
+  uint32 width = 5;             // physical pixels
+  uint32 height = 6;
+  float scale = 7;              // logical-to-physical
+  bool primary = 8;
+}
+
+message MonitorList {
+  repeated Display displays = 1;
+}
+
+message SelectMonitor {
+  uint32 display_id = 1;        // 0xFFFFFFFF = all monitors (FR-22)
+}
+
+enum QualityMode {
+  QUALITY_MODE_SPEED = 0;       // default
+  QUALITY_MODE_BALANCED = 1;
+  QUALITY_MODE_QUALITY = 2;
+}
+
+message SetQuality {
+  QualityMode mode = 1;
+}
+
+message IdrRequest {
+  uint32 stream_id = 1;
+  uint64 last_good_frame = 2;
+}
+
+// Sent by the Controller every 100 ms (§6 rule 7).
+message AbrFeedback {
+  uint32 receive_kbps = 1;
+  uint32 loss_permille = 2;
+  sint32 delay_trend_us = 3;    // change in one-way queueing delay
+  uint32 decode_time_us = 4;
+  uint32 frames_dropped = 5;
+}
+
+message StreamConfig {
+  uint32 stream_id = 1;
+  Codec codec = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 fps = 5;
+  uint32 bitrate_kbps = 6;
+}
+
+enum EndReason {
+  END_REASON_UNSPECIFIED = 0;
+  END_REASON_CONTROLLER_LEFT = 1;
+  END_REASON_HOST_ENDED = 2;    // FR-10
+  END_REASON_REBOOT = 3;        // FR-34
+  END_REASON_ERROR = 4;
+}
+
+message SessionEnd {
+  EndReason reason = 1;
+  string detail = 2;
+}
+
+enum PowerAction {
+  POWER_ACTION_UNSPECIFIED = 0;
+  POWER_ACTION_REBOOT = 1;
+  POWER_ACTION_REBOOT_SAFE_MODE = 2;
+}
+
+message PowerRequest {
+  PowerAction action = 1;
+}
+
+message SendSas {}
+
+message ControlMessage {
+  oneof msg {
+    Hello hello = 1;
+    AuthMessage auth = 2;
+    AuthOutcome auth_outcome = 3;
+    Permissions permissions = 4;
+    MonitorList monitors = 5;
+    SelectMonitor select_monitor = 6;
+    SetQuality set_quality = 7;
+    IdrRequest idr_request = 8;
+    AbrFeedback abr_feedback = 9;
+    StreamConfig stream_config = 10;
+    SessionEnd end = 11;
+    PowerRequest power = 12;
+    SendSas send_sas = 13;
+  }
+}
+
+// ---------------------------------------------------------------- input
+
+message MouseMove {
+  float x = 1;                  // normalised 0..1 within the selected display
+  float y = 2;
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_LEFT = 0;
+  MOUSE_BUTTON_RIGHT = 1;
+  MOUSE_BUTTON_MIDDLE = 2;
+  MOUSE_BUTTON_BACK = 3;
+  MOUSE_BUTTON_FORWARD = 4;
+}
+
+message MouseButtonEvent {
+  MouseButton button = 1;
+  bool down = 2;
+}
+
+message Scroll {
+  float dx = 1;                 // logical pixels (high precision)
+  float dy = 2;
+  bool precise = 3;             // trackpad vs. wheel notches
+}
+
+message KeyEvent {
+  uint32 usb_hid_usage = 1;     // physical key, USB HID usage page 0x07
+  bool down = 2;
+  uint32 modifiers = 3;         // bitmask, see relay-input::Modifiers
+}
+
+message TextInput {
+  string text = 1;              // "translate characters" mode (FR-14)
+}
+
+message InputEvent {
+  uint64 ts_us = 1;             // Controller monotonic clock
+  oneof event {
+    MouseMove mouse_move = 2;
+    MouseButtonEvent mouse_button = 3;
+    Scroll scroll = 4;
+    KeyEvent key = 5;
+    TextInput text = 6;
+  }
+}
+
+// ---------------------------------------------------------------- cursor
+
+message CursorShape {
+  uint64 hash = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 hotspot_x = 4;
+  uint32 hotspot_y = 5;
+  bytes rgba = 6;               // empty if the peer already cached `hash`
+}
+
+message CursorPosition {
+  float x = 1;
+  float y = 2;
+  bool visible = 3;
+  uint64 shape_hash = 4;
+}
+
+// ---------------------------------------------------------------- clipboard & chat
+
+message ClipboardData {
+  oneof data {
+    string text = 1;
+    bytes png = 2;
+  }
+}
+
+message ChatMessage {
+  uint64 id = 1;
+  uint64 sent_at_ms = 2;        // unix epoch ms
+  string text = 3;
+}
+
+// ---------------------------------------------------------------- files
+
+message ListDir {
+  string path = 1;
+}
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+  uint64 modified_ms = 4;
+}
+
+message DirListing {
+  string path = 1;
+  repeated DirEntry entries = 2;
+  string error = 3;
+}
+
+enum FileOp {
+  FILE_OP_UNSPECIFIED = 0;
+  FILE_OP_MKDIR = 1;
+  FILE_OP_RENAME = 2;
+  FILE_OP_DELETE = 3;
+}
+
+message FileOpRequest {
+  FileOp op = 1;
+  string path = 2;
+  string new_path = 3;
+}
+
+message TransferStart {
+  string path = 1;
+  uint64 size = 2;
+  uint32 chunk_size = 3;
+  bytes file_blake3 = 4;
+  uint64 resume_from_chunk = 5;
+  bool upload = 6;              // true = Controller to Host
+}
+
+message FileChunk {
+  uint64 index = 1;
+  bytes chunk_blake3 = 2;
+  bytes data = 3;
+}
+
+message TransferAck {
+  uint64 next_chunk = 1;
+  string error = 2;
+  bool cancelled = 3;
+}
+
+message FileMessage {
+  oneof msg {
+    ListDir list_dir = 1;
+    DirListing listing = 2;
+    FileOpRequest op = 3;
+    TransferStart start = 4;
+    FileChunk chunk = 5;
+    TransferAck ack = 6;
+  }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "relay-capture"
+description = "Screen capture trait with Windows (DXGI/WGC) and macOS (ScreenCaptureKit) backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "relay-server"
+description = "Rendezvous and relay server for Relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "relay-server"
+path = "src/main.rs"
+
+[dependencies]
+relay-net.workspace = true
+
+[lints]
+workspace = true

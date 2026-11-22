@@ -1,0 +1,15 @@
+[package]
+name = "relay-input"
+description = "Input event model, key mapping and InputInjector/InputCapturer traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

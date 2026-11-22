@@ -1,0 +1,15 @@
+[package]
+name = "relay-render"
+description = "wgpu remote-screen viewer: NV12 to RGB shader, cursor overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+
+[lints]
+workspace = true

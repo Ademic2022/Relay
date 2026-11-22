@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/latency-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Ademic2022/Relay"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+relay-proto = { path = "crates/relay-proto" }
+relay-net = { path = "crates/relay-net" }
+relay-capture = { path = "crates/relay-capture" }
+relay-codec = { path = "crates/relay-codec" }
+
+prost = "0.14"
+prost-build = "0.14"
+protoc-bin-vendored = "3.3"
+ed25519-dalek = "3"
+blake3 = "1.8"
+getrandom = "0.4"
+thiserror = "2"
+bytes = "1.12"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

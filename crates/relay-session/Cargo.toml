@@ -1,0 +1,20 @@
+[package]
+name = "relay-session"
+description = "Platform-agnostic session logic: state machine, frame pacing, ABR, safety rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+relay-proto.workspace = true
+
+[dev-dependencies]
+relay-capture.workspace = true
+relay-codec.workspace = true
+relay-net.workspace = true
+
+[lints]
+workspace = true
