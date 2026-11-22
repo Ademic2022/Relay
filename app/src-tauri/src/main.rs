@@ -208,6 +208,19 @@ fn start_host(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
             .map(|l| clean(l))
             .find(|l| !l.is_empty() && !l.contains(" INFO ") && !l.contains(" DEBUG "))
             .unwrap_or_default();
+        // A multi-line error (e.g. the Screen Recording one) reads best whole.
+        let all: String = tail
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .map(|l| clean(l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let last = if all.to_ascii_lowercase().contains("screen recording") {
+            all
+        } else {
+            last
+        };
         let _ = app2.emit(
             "host_exit",
             serde_json::json!({ "code": code, "message": friendly(&last), "raw": last }),

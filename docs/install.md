@@ -2,15 +2,17 @@
 
 ## macOS (13 Ventura or later)
 
-1. Open `Relay-<version>.pkg` and follow the installer. It puts `relay` in
-   `/usr/local/bin`.
-2. In Terminal: `relay host`. macOS asks for **Screen Recording** permission
-   the first time; allow it in System Settings → Privacy & Security →
-   Screen & System Audio Recording, then run `relay host` again. To be
-   controlled, also allow **Accessibility**.
-3. Read out the **ID** and **Password** it prints to whoever is helping you.
+1. Open `Relay-<version>.pkg` and follow the installer. It installs
+   **Relay.app** in Applications and the `relay` command in `/usr/local/bin`.
+2. Open **Relay** from Applications. macOS asks for **Screen Recording**
+   permission the first time; allow it in System Settings → Privacy &
+   Security → Screen & System Audio Recording, then reopen Relay. To be
+   controlled, also allow **Accessibility** (Settings → macOS permissions in
+   the app opens both pages).
+3. Read out your **ID** and **Password** to whoever is helping you.
 
-To connect to someone: `relay connect <their ID>` and type the password.
+To connect to someone: type their ID in "Control remote device" and click
+Connect (or `relay connect <their ID>` in Terminal).
 
 ## Windows (10 21H2+ / 11)
 
@@ -38,6 +40,6 @@ URL and release key; the download is signature- and hash-checked).
 
 ## Uninstalling
 
-- macOS: `sudo relay unattended disable` (if used), then `sudo rm /usr/local/bin/relay`
-  and `pkgutil --forget com.relay.client`.
+- macOS: `sudo relay unattended disable` (if used), then drag Relay to the
+  Trash, `sudo rm /usr/local/bin/relay` and `pkgutil --forget com.relay.client`.
 - Windows: Settings → Apps → Relay → Uninstall (also removes unattended access).

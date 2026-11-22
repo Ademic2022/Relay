@@ -1,4 +1,7 @@
 #!/bin/sh
-# Relay is installed to /usr/local/bin/relay. Unattended access is opt-in:
-# an administrator runs `sudo relay unattended setup` afterwards.
+# Relay.app is in /Applications. Put the engine on PATH so `relay …`
+# (unattended setup, config, logs) works from Terminal.
+mkdir -p /usr/local/bin
+ln -sf "/Applications/Relay.app/Contents/MacOS/relay" /usr/local/bin/relay
+# Unattended access stays opt-in: `sudo relay unattended setup`.
 exit 0

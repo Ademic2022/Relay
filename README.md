@@ -157,7 +157,8 @@ The UI is plain HTML/CSS/JS in `app/ui/` (no bundler), type-checked with
   clipboard, cmd_ctrl_swap, start_with_os, language, update_url (FR-41).
 - `relay update check | apply`: Ed25519-signed manifests, BLAKE3-checked downloads, no
   downgrades (FR-42). Release keys: `cargo run -p relay-release -- keygen`.
-- Installers: `installer/macos/build-pkg.sh` (.pkg; signs and notarises when the
+- Installers: `installer/macos/build-app.sh` builds `Relay.app` (window + engine);
+  `installer/macos/build-pkg.sh` (.pkg with Relay.app in /Applications; signs and notarises when the
   `MACOS_*` variables are set) and `installer/windows/build.ps1` (WiX MSI; signs with
   `WINDOWS_SIGN_THUMBPRINT`). Both enforce the 25 MB limit. Tagging `vX.Y.Z` runs
   `.github/workflows/release.yml`.
