@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Relay</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="strings.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 6l6 6-6 6M12 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <h1>Relay</h1>
+    <nav role="tablist" aria-label="Sections">
+      <button role="tab" id="tab-home" aria-controls="view-home" aria-selected="true" data-i18n="tab.home">Home</button>
+      <button role="tab" id="tab-activity" aria-controls="view-activity" aria-selected="false" tabindex="-1" data-i18n="tab.activity">Activity</button>
+      <button role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1" data-i18n="tab.settings">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Home -->
+    <section id="view-home" role="tabpanel" aria-labelledby="tab-home">
+      <div id="notice" class="notice" hidden role="alert"></div>
+
+      <article class="card" aria-labelledby="h-allow">
+        <h2 id="h-allow" data-i18n="allow.title">Allow remote control</h2>
+        <p class="muted" id="host-status" data-i18n="allow.starting">Starting…</p>
+
+        <div id="creds" hidden>
+          <div class="field-ro">
+            <span class="label" data-i18n="allow.id">Your ID</span>
+            <div class="value-row">
+              <output id="my-id" class="big mono">—</output>
+              <button class="icon" id="copy-id" data-i18n-label="copy" aria-label="Copy">⧉</button>
+            </div>
+            <span class="hint" id="id-hint"></span>
+          </div>
+          <div class="field-ro" id="pw-block">
+            <span class="label" data-i18n="allow.password">Password</span>
+            <div class="value-row">
+              <output id="my-pw" class="big mono">—</output>
+              <button class="icon" id="copy-pw" data-i18n-label="copy" aria-label="Copy">⧉</button>
+              <button class="icon" id="new-pw" data-i18n-label="allow.newPassword" aria-label="New password">↻</button>
+            </div>
+            <span class="hint" data-i18n="allow.passwordHint">Changes after every session.</span>
+          </div>
+          <details class="direct">
+            <summary data-i18n="allow.direct">Direct address (same network)</summary>
+            <ul id="direct-list" class="mono"></ul>
+          </details>
+        </div>
+
+        <div id="session" class="session" hidden>
+          <p><span class="dot live" aria-hidden="true"></span> <strong id="session-who"></strong></p>
+          <div class="chat" aria-label="Chat">
+            <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
+            <form id="chat-form" class="row">
+              <label class="sr-only" for="chat-input" data-i18n="chat.label">Message</label>
+              <input id="chat-input" autocomplete="off" data-i18n-ph="chat.placeholder" placeholder="Message the viewer…">
+              <button type="submit" data-i18n="chat.send">Send</button>
+            </form>
+          </div>
+          <button id="end-session" class="danger wide" data-i18n="session.end">End session</button>
+          <p class="hint" data-i18n="session.hotkey">Or press Ctrl+Alt+Shift+X anywhere.</p>
+        </div>
+      </article>
+
+      <article class="card" aria-labelledby="h-control">
+        <h2 id="h-control" data-i18n="control.title">Control a remote computer</h2>
+        <form id="connect-form">
+          <label for="target" data-i18n="control.partner">Partner ID or address</label>
+          <input id="target" class="mono" autocomplete="off" spellcheck="false" inputmode="text"
+                 data-i18n-ph="control.partnerPh" placeholder="123 456 789 or 192.168.1.20:21118" required>
+          <label for="password" data-i18n="control.password">Password</label>
+          <input id="password" type="password" autocomplete="off" required>
+          <button type="submit" id="connect" class="primary wide" data-i18n="control.connect">Connect</button>
+          <p id="connect-msg" class="msg" role="status" aria-live="polite"></p>
+        </form>
+        <div id="recent-block" hidden>
+          <h3 data-i18n="control.recent">Recent</h3>
+          <ul id="recent" class="recent"></ul>
+        </div>
+      </article>
+    </section>
+
+    <!-- Activity -->
+    <section id="view-activity" role="tabpanel" aria-labelledby="tab-activity" hidden>
+      <article class="card">
+        <div class="row between">
+          <h2 data-i18n="activity.title">Connection log</h2>
+          <button id="refresh-audit" data-i18n="activity.refresh">Refresh</button>
+        </div>
+        <p class="hint" data-i18n="activity.hint">Every connection to this computer. A viewer can't change it.</p>
+        <pre id="audit" class="log mono" tabindex="0"></pre>
+      </article>
+    </section>
+
+    <!-- Settings -->
+    <section id="view-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <article class="card">
+        <h2 data-i18n="settings.title">Settings</h2>
+        <form id="settings-form">
+          <fieldset>
+            <legend data-i18n="settings.server">Relay server (self-hosting)</legend>
+            <label for="s-server" data-i18n="settings.serverAddr">Server address</label>
+            <input id="s-server" data-key="server" class="mono" placeholder="relay.example.com" spellcheck="false">
+            <label for="s-server_key" data-i18n="settings.serverKey">Server key</label>
+            <input id="s-server_key" data-key="server_key" class="mono" placeholder="64 hex characters" spellcheck="false">
+            <p class="hint" data-i18n="settings.serverHint">Needed to connect by ID. Without a server, use direct addresses.</p>
+          </fieldset>
+          <fieldset>
+            <legend data-i18n="settings.session">Sessions</legend>
+            <label for="s-quality" data-i18n="settings.quality">Default quality</label>
+            <select id="s-quality" data-key="quality">
+              <option value="speed" data-i18n="q.speed">Speed (lowest latency)</option>
+              <option value="balanced" data-i18n="q.balanced">Balanced</option>
+              <option value="quality" data-i18n="q.quality">Quality (sharpest)</option>
+            </select>
+            <label class="check"><input type="checkbox" id="s-clipboard" data-key="clipboard"> <span data-i18n="settings.clipboard">Sync clipboard</span></label>
+            <label class="check"><input type="checkbox" id="s-cmd_ctrl_swap" data-key="cmd_ctrl_swap"> <span data-i18n="settings.swap">Swap ⌘ and Ctrl between Mac and Windows</span></label>
+            <label class="check"><input type="checkbox" id="s-start_with_os" data-key="start_with_os"> <span data-i18n="settings.startup">Start Relay when I log in</span></label>
+          </fieldset>
+          <fieldset>
+            <legend data-i18n="settings.unattended">Unattended access</legend>
+            <p class="hint" data-i18n="settings.unattendedHint">To reach this computer when nobody is at it, an administrator runs this once:</p>
+            <code class="block mono" id="unattended-cmd">sudo relay unattended setup</code>
+          </fieldset>
+          <fieldset>
+            <legend data-i18n="settings.permissions">Permissions (macOS)</legend>
+            <div class="row wrap">
+              <button type="button" id="perm-screen" data-i18n="settings.screen">Screen Recording…</button>
+              <button type="button" id="perm-ax" data-i18n="settings.ax">Accessibility…</button>
+            </div>
+          </fieldset>
+          <div class="row between">
+            <span id="settings-msg" class="msg" role="status" aria-live="polite"></span>
+            <button type="submit" class="primary" data-i18n="settings.save">Save</button>
+          </div>
+        </form>
+        <p class="hint" id="version"></p>
+      </article>
+    </section>
+  </main>
+
+  <!-- FR-8 consent -->
+  <div id="consent" class="modal" hidden role="alertdialog" aria-modal="true" aria-labelledby="consent-title" aria-describedby="consent-body">
+    <div class="modal-box">
+      <h2 id="consent-title" data-i18n="consent.title">Connection request</h2>
+      <p id="consent-body"></p>
+      <p class="hint" id="consent-timer"></p>
+      <div class="row end">
+        <button id="consent-decline" data-i18n="consent.decline">Decline</button>
+        <button id="consent-accept" class="primary" data-i18n="consent.accept">Accept</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

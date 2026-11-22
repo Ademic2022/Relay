@@ -42,6 +42,8 @@ pub struct Options {
     /// Run as the unattended agent (FR-32): system identity, permanent
     /// password, no Accept prompt.
     pub unattended: bool,
+    /// Driven by the Relay app (see `ui.rs`).
+    pub ui: bool,
 }
 
 fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCapturer>> {
@@ -54,9 +56,13 @@ fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCaptu
 pub fn run(opts: Options) -> anyhow::Result<()> {
     let cap = capturer(&opts)?;
     let displays = cap.displays().map_err(|e| match e {
-        relay_capture::CaptureError::PermissionDenied if cfg!(target_os = "macos") => anyhow::anyhow!(
-            "Screen Recording permission is not granted.\n  Open System Settings → Privacy & Security → Screen & System Audio Recording,\n  enable your terminal app, then restart it."
-        ),
+        relay_capture::CaptureError::PermissionDenied if cfg!(target_os = "macos") => {
+            crate::ui::emit("error", serde_json::json!({ "kind": "screen_recording" }));
+            anyhow::anyhow!(
+                "Screen Recording permission is not granted.\n  Open System Settings → Privacy & Security → Screen & System Audio Recording,\n  enable {}, then restart it.",
+                if opts.ui { "Relay" } else { "your terminal app" }
+            )
+        }
         e => e.into(),
     })?;
     if opts.list_displays {
@@ -141,6 +147,10 @@ impl HostState {
         match Credentials::new() {
             Ok(c) => {
                 println!("  New password: {}\n", c.otp.as_str());
+                crate::ui::emit(
+                    "password",
+                    serde_json::json!({ "password": c.otp.as_str() }),
+                );
                 *self.creds.lock().expect("poisoned") = Arc::new(c);
             }
             Err(e) => tracing::error!("could not rotate the password: {e}"),
@@ -201,7 +211,10 @@ async fn serve(
         ));
         let _ = tokio::time::timeout(Duration::from_secs(5), id_rx.wait_for(|v| v.is_some())).await;
         match *id_rx.borrow() {
-            Some(id) => println!("  Your ID       {id}"),
+            Some(id) => {
+                println!("  Your ID       {id}");
+                crate::ui::emit("id", serde_json::json!({ "id": id.to_string() }));
+            }
             None => println!(
                 "  Your ID       (rendezvous server {} not reachable yet; retrying)",
                 server.addr
@@ -214,13 +227,25 @@ async fn serve(
         println!("  Password      {}", creds.otp.as_str());
     }
     let port = node.endpoint.local_addr()?.port();
+    let mut direct = Vec::new();
     for c in crate::rdv::local_candidates(&node) {
         let ip = c
             .rsplit_once(':')
             .map_or(c.as_str(), |(ip, _)| ip)
             .to_string();
         println!("  Direct        relay view {ip}:{port}");
+        direct.push(format!("{ip}:{port}"));
     }
+    crate::ui::emit(
+        "ready",
+        serde_json::json!({
+            "password": (!opts.unattended).then(|| creds.otp.as_str().to_string()),
+            "direct": direct,
+            "server": opts.server.map(|s| s.addr.to_string()),
+            "display": format!("{}x{}", display.width, display.height),
+            "view_only": opts.view_only,
+        }),
+    );
     println!("  Device key    {}", relay_net::hex(&me.public_key()));
     println!(
         "  Sharing       display {} ({}x{}){}",
@@ -245,12 +270,32 @@ async fn serve(
         streaming: tokio::sync::Mutex::new(()),
         quit: tokio::sync::Notify::new(),
     });
+    if opts.ui {
+        // App commands outside a session; stdin closing ends the host.
+        let st = st.clone();
+        let mut cmds = crate::ui::commands();
+        tokio::spawn(async move {
+            while let Ok(c) = cmds.recv().await {
+                let in_session = st.streaming.try_lock().is_err();
+                match c {
+                    crate::ui::Cmd::NewPassword if !in_session => st.rotate(),
+                    // Only while a session runs, so no stale wake-up is
+                    // left for the next one.
+                    crate::ui::Cmd::End if in_session => {
+                        crate::banner::end_requested().notify_one()
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
     loop {
         let incoming = tokio::select! {
             i = node.endpoint.accept() => match i { Some(i) => i, None => break },
             _ = id_rx.changed() => {
                 if let Some(id) = *id_rx.borrow() {
                     println!("  Your ID       {id}");
+                    crate::ui::emit("id", serde_json::json!({ "id": id.to_string() }));
                 }
                 continue;
             }
@@ -374,6 +419,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         Ok(auth::HostAuth::BadPassword) | Err(_) => {
             audit(&format!("FAILED login from {name}"));
             println!("  ! Failed connection attempt from {name}");
+            crate::ui::emit("failed_login", serde_json::json!({ "name": name }));
             if result.is_err() {
                 conn.close(1u32.into(), b"auth aborted");
                 return Ok(SessionOutcome::Rejected);
@@ -393,12 +439,19 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     // One session (and one consent dialog) at a time.
     let Ok(_streaming) = st.streaming.try_lock() else {
         println!("  ○ {name} tried to connect while another session is active.");
+        crate::ui::emit("busy", serde_json::json!({ "name": name }));
         return reject(&mut tx, v1::AuthResult::Declined, 0).await;
     };
 
     // FR-8: an attended session needs the local user's explicit yes.
     // FR-33: unattended sessions skip it (the banner still shows).
-    if !unattended && !crate::consent::ask(&name).await {
+    let accepted = unattended
+        || if opts.ui {
+            crate::ui::consent(&name).await
+        } else {
+            crate::consent::ask(&name).await
+        };
+    if !accepted {
         audit(&format!("DECLINED {name}"));
         println!("  ○ Declined {name}.");
         return reject(&mut tx, v1::AuthResult::Declined, 0).await;
@@ -439,6 +492,10 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     );
     // FR-9 / FR-33: the banner shows whenever someone is at the Host,
     // attended or not. The Controller has no way to hide it.
+    crate::ui::emit(
+        "session_start",
+        serde_json::json!({ "name": name, "unattended": unattended, "view_only": opts.view_only }),
+    );
     let banner_shown = !unattended || relay_service::console_user_present();
     if banner_shown {
         st.banner.show(&name);
@@ -509,8 +566,23 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         .then(|| tokio::spawn(crate::files::accept_loop(conn.clone())));
     // Chat (FR-24): lines typed in this terminal go to the viewer.
     let chat = crate::chat::ChatLink::start(conn);
-    println!("  Type a message and press Enter to chat with the viewer.");
-    let chat_task = {
+    let chat_task = if opts.ui {
+        let mut cmds = crate::ui::commands();
+        tokio::spawn(async move {
+            while let Ok(c) = cmds.recv().await {
+                if let crate::ui::Cmd::Chat(text) = c {
+                    let sent = chat.send(&text);
+                    if !sent.is_empty() {
+                        crate::ui::emit(
+                            "chat",
+                            serde_json::json!({ "from_me": true, "text": sent }),
+                        );
+                    }
+                }
+            }
+        })
+    } else {
+        println!("  Type a message and press Enter to chat with the viewer.");
         let mut lines = crate::stdin::lines();
         tokio::spawn(async move {
             while let Ok(l) = lines.recv().await {
@@ -690,6 +762,7 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         tracing::error!("pipeline: {e}");
     }
     println!("  ○ Session ended: {reason}.");
+    crate::ui::emit("session_end", serde_json::json!({ "reason": reason }));
     audit(&format!(
         "SESSION END {name}: {reason}, duration {}s",
         started.elapsed().as_secs()

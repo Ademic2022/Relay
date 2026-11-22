@@ -38,6 +38,7 @@ mod rt;
 mod sender;
 mod settings;
 mod stdin;
+mod ui;
 mod unattended;
 mod update;
 mod viewer;
@@ -97,6 +98,10 @@ struct ViewerArgs {
     /// Password shown by the host (prompted for if omitted).
     #[arg(long, alias = "code")]
     password: Option<String>,
+    /// Read the password from the first line of stdin (used by the app,
+    /// so it never appears in the process list).
+    #[arg(long, conflicts_with = "password")]
+    password_stdin: bool,
     /// Measure glass-to-glass latency from the host's --test-pattern
     /// timestamp stripe (clocks must be synced across machines).
     #[arg(long)]
@@ -202,6 +207,9 @@ enum Cmd {
         /// Run as the unattended agent (started by the service; FR-32).
         #[arg(long, hide = true)]
         unattended: bool,
+        /// Driven by the Relay app over stdin/stdout (see ui.rs).
+        #[arg(long, hide = true)]
+        ui: bool,
     },
     /// Unattended access to this computer (run as administrator).
     Unattended {
@@ -367,7 +375,14 @@ fn main() -> anyhow::Result<()> {
             no_clipboard,
             no_files,
             unattended,
+            ui: ui_mode,
         } => host::run(host::Options {
+            ui: {
+                if ui_mode {
+                    ui::enable();
+                }
+                ui_mode
+            },
             unattended,
             clipboard: !no_clipboard,
             files: !no_files,
@@ -409,6 +424,11 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
     let st = settings::Settings::load();
     let password = match v.password {
         Some(p) => p,
+        None if v.password_stdin => {
+            let mut l = String::new();
+            std::io::stdin().read_line(&mut l)?;
+            l
+        }
         None => rpassword::prompt_password(format!("Password for {target}: "))?,
     };
     viewer::run(viewer::ViewOptions {

@@ -140,6 +140,10 @@ async fn serve_streams<F>(
                         crate::chat::clock(m.sent_at_ms),
                         m.text
                     );
+                    crate::ui::emit(
+                        "chat",
+                        serde_json::json!({ "from_me": false, "name": who, "text": m.text }),
+                    );
                     true
                 });
             }

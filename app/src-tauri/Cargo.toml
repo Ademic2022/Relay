@@ -1,0 +1,29 @@
+[package]
+name = "relay-ui"
+description = "Relay desktop app (Tauri 2): ID/password, connect, consent, settings, activity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "relay-app"
+path = "src/main.rs"
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[features]
+default = ["custom-protocol"]
+# Serve the UI from the embedded files (no dev server).
+custom-protocol = ["tauri/custom-protocol"]
+
+[lints]
+workspace = true
