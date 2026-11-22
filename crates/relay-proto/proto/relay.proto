@@ -45,6 +45,12 @@ message Hello {
 message AuthMessage {
   uint32 step = 1;
   bytes payload = 2;
+  PasswordKind password_kind = 3;   // step 1 only
+}
+
+enum PasswordKind {
+  PASSWORD_KIND_ONE_TIME = 0;       // attended: shown on the Host's screen
+  PASSWORD_KIND_PERMANENT = 1;      // unattended access (FR-31)
 }
 
 enum AuthResult {

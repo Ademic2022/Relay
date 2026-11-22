@@ -17,7 +17,8 @@ Built milestone by milestone (PRD §12).
 | M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
 | M5 Multi-monitor, chat, clipboard | monitor list + live switching, clipboard text both ways, chat (viewer panel, host terminal); FR-22 all-monitors view not done |
 | M6 File transfer | resumable chunked transfers with BLAKE3, two-pane file manager, drag-and-drop; 5 GB + resume test passing; folders not yet |
-| M7–M8 | not started |
+| M7 Unattended access | permanent password + allow-list, agent mode, banner window, audit + diagnostic logs, reboot/safe mode/Ctrl+Alt+Del, auto-reconnect, Windows service + macOS launchd supervisor; tested locally without installing the service; reboot/login-screen acceptance needs real machines |
+| M8 Ship | not started |
 
 ## Layout
 
@@ -31,7 +32,7 @@ Built milestone by milestone (PRD §12).
 | `relay-input` | input model (USB HID usages + macOS/Windows key tables), ⌘/Ctrl mapping, HiDPI mapping; CGEvent (macOS) and SendInput (Windows) injectors |
 | `relay-session` | newest-wins channel, ABR controller, congestion-aware IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
 | `relay-render` | viewer present-mode policy (wgpu viewer in M1) |
-| `relay-service` | unattended-access agent targets (service in M7) |
+| `relay-service` | Windows service (agent launcher, Ctrl+Alt+Del, reboot, DPAPI) and macOS launchd supervisor |
 | `relay-server` | rendezvous (Device IDs, lookup, punch coordination) + blind UDP relay; Dockerfile |
 | `relay-app` | `relay` binary: M1 host (capture → encode → QUIC datagrams) and wgpu viewer |
 | `tools/latency-bench` | latency percentiles and release regression gate |
@@ -98,6 +99,38 @@ either side turns it off. `--no-cmd-ctrl-swap`, `--translate-chars`,
 Ctrl+Alt+Del) are not captured yet. `RELAY_KEYSTORE=memory` uses a throwaway device key.
 
 On Windows, allow `relay.exe` through Windows Firewall.
+
+## Unattended access (M7)
+
+Reach your own computer when nobody is at it, including after a reboot and at the login
+screen. Run once, as administrator:
+
+```sh
+sudo relay unattended setup [--allow "123 456 789"]   # macOS (Windows: elevated terminal)
+relay unattended setup --dry-run                     # see what it would install
+relay unattended status
+sudo relay unattended disable                        # removes the service; password stops working at once
+```
+
+Setup stores only an OPAQUE verifier of the permanent password (12+ characters) and the device
+key, owner-only, in `/Library/Application Support/Relay` (macOS) or `%ProgramData%\Relay`
+(Windows, sealed with machine DPAPI). It installs:
+
+- **Windows**: `RelayService` (LocalSystem). It keeps the agent (`relay host --unattended`)
+  running as SYSTEM in the active console session, so the login screen and UAC prompts are
+  reachable; it also performs Ctrl+Alt+Del and runs in Safe Mode with networking.
+- **macOS**: a LaunchDaemon that starts the agent in the logged-in user's session, and a
+  LoginWindow LaunchAgent for the login window. Grant the binary Screen Recording,
+  Accessibility (and optionally Full Disk Access) in System Settings. The FileVault unlock
+  screen at power-on runs before macOS and cannot be reached.
+
+Connect with `relay connect <ID>` and the permanent password: no Accept prompt, but the red
+"Being controlled by …" banner still shows whenever someone is logged in (FR-33). From the
+viewer, `Ctrl+Alt+R` twice restarts the host (`Ctrl+Alt+Shift+R`: Safe Mode, Windows) and
+`Ctrl+Alt+End` sends Ctrl+Alt+Del; the viewer shows "Waiting for device…" and reconnects.
+
+Every connection is recorded: `relay audit` (`--unattended` for the agent's log).
+Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
 
 ## Network-emulation tests (M4)
 

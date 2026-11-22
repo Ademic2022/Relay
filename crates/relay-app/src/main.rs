@@ -14,8 +14,10 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use tracing_subscriber::Layer;
 
 mod auth;
+mod banner;
 mod chat;
 mod clipboard;
 mod clock;
@@ -26,6 +28,7 @@ mod host;
 mod host_input;
 mod identity;
 mod input_wire;
+mod logs;
 mod migrate;
 #[cfg(test)]
 mod netem_tests;
@@ -34,6 +37,7 @@ mod rdv;
 mod rt;
 mod sender;
 mod stdin;
+mod unattended;
 mod viewer;
 
 /// Default port for direct (no-rendezvous) connections.
@@ -117,6 +121,30 @@ enum Quality {
 }
 
 #[derive(Debug, Subcommand)]
+enum UnattendedCmd {
+    /// Set a permanent password and install the service (FR-31).
+    Setup {
+        /// Only allow these Controller Device IDs (repeatable).
+        #[arg(long = "allow", value_name = "ID")]
+        allow: Vec<String>,
+        /// Store the password but do not install the service.
+        #[arg(long)]
+        no_service: bool,
+        /// Print what would be done and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the service and invalidate the permanent password (FR-38).
+    Disable,
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCmd {
+    Run,
+}
+
+#[derive(Debug, Subcommand)]
 enum Cmd {
     /// Share this machine's screen.
     Host {
@@ -149,6 +177,31 @@ enum Cmd {
         /// Do not let the viewer browse or transfer files (FR-26).
         #[arg(long)]
         no_files: bool,
+        /// Run as the unattended agent (started by the service; FR-32).
+        #[arg(long, hide = true)]
+        unattended: bool,
+    },
+    /// Unattended access to this computer (run as administrator).
+    Unattended {
+        #[command(subcommand)]
+        cmd: UnattendedCmd,
+    },
+    /// The background service (started by the OS).
+    #[command(hide = true)]
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Show this computer's connection audit log (FR-39).
+    Audit {
+        /// The unattended agent's log instead of this user's.
+        #[arg(long)]
+        unattended: bool,
+    },
+    /// Show where the diagnostic logs are (FR-40).
+    Logs {
+        #[arg(long)]
+        unattended: bool,
     },
     /// Connect to a host by its 9-digit ID.
     Connect {
@@ -176,17 +229,80 @@ enum Cmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,quinn=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn".into()
-            }),
-        )
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "info,quinn=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn".into()
+        })
+    };
+    let stderr = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_filter(filter());
+    // FR-40: also to a rotating file (10 MB cap) for "copy logs".
+    let file = logs::Rotating::open(logs::data_dir(), logs::DIAG_CAP)
+        .ok()
+        .map(|r| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(logs::DiagLog(std::sync::Mutex::new(r)))
+                .with_filter(filter())
+        });
+    tracing_subscriber::registry()
+        .with(stderr)
+        .with(file)
         .init();
+}
 
-    match Cli::parse().cmd {
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // The agent and service keep their logs in the system folder.
+    let system = matches!(
+        cli.cmd,
+        Cmd::Host {
+            unattended: true,
+            ..
+        } | Cmd::Service { .. }
+            | Cmd::Unattended { .. }
+            | Cmd::Audit { unattended: true }
+            | Cmd::Logs { unattended: true }
+    );
+    if system {
+        logs::set_data_dir(unattended::system_dir());
+    }
+    init_logging();
+
+    match cli.cmd {
+        Cmd::Unattended { cmd } => match cmd {
+            UnattendedCmd::Setup {
+                allow,
+                no_service,
+                dry_run,
+            } => unattended::setup(unattended::SetupArgs {
+                allow,
+                no_service,
+                dry_run,
+                password: None,
+            }),
+            UnattendedCmd::Disable => unattended::disable(),
+            UnattendedCmd::Status => unattended::status(),
+        },
+        Cmd::Service {
+            cmd: ServiceCmd::Run,
+        } => relay_service::run(&relay_service::current_binary()?).map_err(anyhow::Error::from),
+        Cmd::Audit { .. } => {
+            match logs::read_audit() {
+                Ok(t) => print!("{t}"),
+                Err(_) => println!("(no connections recorded yet)"),
+            }
+            Ok(())
+        }
+        Cmd::Logs { .. } => {
+            println!("{}", logs::data_dir().join("diag.log").display());
+            Ok(())
+        }
         Cmd::Host {
             bind,
             server,
@@ -199,7 +315,9 @@ fn main() -> anyhow::Result<()> {
             view_only,
             no_clipboard,
             no_files,
+            unattended,
         } => host::run(host::Options {
+            unattended,
             clipboard: !no_clipboard,
             files: !no_files,
             bind,

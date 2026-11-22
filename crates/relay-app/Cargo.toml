@@ -20,6 +20,7 @@ relay-capture.workspace = true
 relay-codec.workspace = true
 relay-session.workspace = true
 relay-input = { path = "../relay-input" }
+relay-service = { path = "../relay-service" }
 latency-bench = { path = "../../tools/latency-bench" }
 anyhow.workspace = true
 bytes.workspace = true
@@ -37,6 +38,7 @@ font8x8 = { version = "0.3", default-features = false }
 arboard = { version = "3", default-features = false }
 jiff = "1"
 blake3.workspace = true
+softbuffer = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }

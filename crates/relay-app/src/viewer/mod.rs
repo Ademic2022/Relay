@@ -107,7 +107,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
         displays: Mutex::new(Vec::new()),
         current_display: std::sync::atomic::AtomicU32::new(0),
     });
-    let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
+    let (quit_tx, quit_rx) = tokio::sync::watch::channel(false);
     // Input from the window to the network. Unbounded: events are tiny and
     // must never be dropped or block the UI thread.
     let (input_tx, input_rx) = tmpsc::unbounded_channel::<v1::InputEvent>();
@@ -134,23 +134,15 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
                         return;
                     }
                 };
-                let res = rt.block_on(network(
-                    opts2,
-                    frame_tx,
-                    proxy.clone(),
-                    shared,
-                    FromWindow {
-                        quit: quit_rx,
-                        input_rx,
-                        ui_rx,
-                        chat_rx,
-                        files_rx,
-                    },
-                ));
-                let msg = match res {
-                    Ok(m) => m,
-                    Err(e) => format!("{e:#}"),
+                let from = FromWindow {
+                    quit: quit_rx,
+                    input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
+                    ui_rx: Arc::new(tokio::sync::Mutex::new(ui_rx)),
+                    chat_rx: Arc::new(tokio::sync::Mutex::new(chat_rx)),
+                    files_rx: Arc::new(tokio::sync::Mutex::new(files_rx)),
                 };
+                let frame_tx = Arc::new(frame_tx);
+                let msg = rt.block_on(reconnecting(opts2, frame_tx, proxy.clone(), shared, from));
                 let _ = proxy.send_event(UserEvent::Closed(msg));
             })?
     };
@@ -272,7 +264,7 @@ fn control(msg: Msg) -> v1::ControlMessage {
 /// Run file manager commands against the host.
 async fn files_worker(
     conn: quinn::Connection,
-    mut rx: tmpsc::UnboundedReceiver<files_ui::FileCmd>,
+    rx: Shared2<files_ui::FileCmd>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     allowed: bool,
 ) {
@@ -281,6 +273,7 @@ async fn files_worker(
     let send = move |e: FileEvent| {
         let _ = proxy.send_event(UserEvent::Files(e));
     };
+    let mut rx = rx.lock().await;
     while let Some(cmd) = rx.recv().await {
         if !allowed {
             send(FileEvent::OpDone(Err(
@@ -352,13 +345,83 @@ async fn files_worker(
     }
 }
 
+/// Shared so each (re)connection can attach to the window's channels.
+type Shared2<T> = Arc<tokio::sync::Mutex<tmpsc::UnboundedReceiver<T>>>;
+
 /// What the window sends to the network side.
+#[derive(Clone)]
 struct FromWindow {
-    quit: tokio::sync::oneshot::Receiver<()>,
-    input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
-    ui_rx: tmpsc::UnboundedReceiver<v1::ControlMessage>,
-    chat_rx: tmpsc::UnboundedReceiver<String>,
-    files_rx: tmpsc::UnboundedReceiver<files_ui::FileCmd>,
+    quit: tokio::sync::watch::Receiver<bool>,
+    input_rx: Shared2<v1::InputEvent>,
+    ui_rx: Shared2<v1::ControlMessage>,
+    chat_rx: Shared2<String>,
+    files_rx: Shared2<files_ui::FileCmd>,
+}
+
+/// Why a connection ended.
+#[derive(Debug)]
+enum Ended {
+    /// The user closed the window.
+    Quit,
+    /// The host ended it; do not reconnect.
+    ByHost(String),
+    /// The host is restarting (FR-34): wait for it to come back.
+    Rebooting,
+    /// The network went away mid-session.
+    Lost(String),
+}
+
+/// Reconnect after drops (60 s, §9) and host restarts (5 min, FR-34).
+async fn reconnecting(
+    opts: ViewOptions,
+    frames_out: Arc<latest::Sender<DecodedFrame>>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    shared: Arc<Shared>,
+    mut from: FromWindow,
+) -> String {
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let r = network(
+            opts.clone(),
+            frames_out.clone(),
+            proxy.clone(),
+            shared.clone(),
+            from.clone(),
+        )
+        .await;
+        let now = tokio::time::Instant::now();
+        match r {
+            Ok(Ended::Quit) => return String::new(),
+            Ok(Ended::ByHost(m)) => return m,
+            Ok(Ended::Rebooting) => {
+                deadline = Some(now + Duration::from_secs(300));
+                let _ = proxy.send_event(UserEvent::Status(
+                    "Host is restarting — waiting for device…".into(),
+                ));
+            }
+            Ok(Ended::Lost(m)) => {
+                tracing::info!("connection lost ({m}); reconnecting");
+                deadline = Some(now + Duration::from_secs(60));
+                let _ =
+                    proxy.send_event(UserEvent::Status("Connection lost — reconnecting…".into()));
+            }
+            Err(e) => match deadline {
+                Some(d) if now < d => {
+                    tracing::debug!("reconnect attempt: {e:#}");
+                    let _ = proxy.send_event(UserEvent::Status("Waiting for device…".into()));
+                }
+                _ => return format!("{e:#}"),
+            },
+        }
+        // Wait a little (or quit if the window closes meanwhile).
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = from.quit.changed() => return String::new(),
+        }
+        if *from.quit.borrow() {
+            return String::new();
+        }
+    }
 }
 
 async fn network(
@@ -370,17 +433,17 @@ async fn network(
         clipboard,
         ..
     }: ViewOptions,
-    frames_out: latest::Sender<DecodedFrame>,
+    frames_out: Arc<latest::Sender<DecodedFrame>>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,
     FromWindow {
         mut quit,
-        mut input_rx,
-        mut ui_rx,
-        mut chat_rx,
+        input_rx,
+        ui_rx,
+        chat_rx,
         files_rx,
     }: FromWindow,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Ended> {
     let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {}…", target)));
     let me = crate::identity::load()?;
     let est = establish(&me, &target, force_relay).await?;
@@ -461,6 +524,7 @@ async fn network(
     let ui_forward = {
         let ctl = ctl_tx.clone();
         tokio::spawn(async move {
+            let mut ui_rx = ui_rx.lock().await;
             while let Some(m) = ui_rx.recv().await {
                 if ctl.send(m).is_err() {
                     break;
@@ -477,6 +541,9 @@ async fn network(
         s.write_all(&[relay_net::channel::Channel::Input as u8])
             .await?;
         tokio::spawn(async move {
+            let mut input_rx = input_rx.lock().await;
+            // Never replay input typed while disconnected.
+            while input_rx.try_recv().is_ok() {}
             while let Some(ev) = input_rx.recv().await {
                 if quic::send_msg(&mut s, &ev).await.is_err() {
                     break;
@@ -497,6 +564,7 @@ async fn network(
     let chat_forward = {
         let link = crate::chat::ChatLink::start(&conn);
         tokio::spawn(async move {
+            let mut chat_rx = chat_rx.lock().await;
             while let Some(t) = chat_rx.recv().await {
                 link.send(&t);
             }
@@ -627,11 +695,15 @@ async fn receive(
     ctl: &tmpsc::UnboundedSender<v1::ControlMessage>,
     shared: &Shared,
     ctl_rx: &mut quinn::RecvStream,
-    quit: &mut tokio::sync::oneshot::Receiver<()>,
+    quit: &mut tokio::sync::watch::Receiver<bool>,
     switched: &tokio::sync::Notify,
-) -> String {
+) -> Ended {
     let mut reasm = Reassembler::new(REASSEMBLY_DEADLINE);
     let mut fb = crate::feedback::Feedback::new();
+    // Video arrives at least once a second (keep-alive, §6 rule 4); this
+    // much silence means the host is gone, long before QUIC's idle timeout.
+    const SILENCE: Duration = Duration::from_secs(4);
+    let mut last_rx = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut need_key = false;
     loop {
@@ -639,9 +711,10 @@ async fn receive(
             dg = conn.read_datagram() => {
                 let dg = match dg {
                     Ok(d) => d,
-                    Err(e) => return format!("connection closed: {e}"),
+                    Err(e) => return Ended::Lost(format!("connection closed: {e}")),
                 };
                 let now = Instant::now();
+                last_rx = now;
                 fb.bytes += dg.len();
                 fb.on_datagram(&dg);
                 let Some(frame) = ({
@@ -663,10 +736,13 @@ async fn receive(
                         need_key = true;
                         let _ = ctl.send(idr_request(f.frame_no));
                     }
-                    Err(TrySendError::Disconnected(_)) => return "decoder stopped".into(),
+                    Err(TrySendError::Disconnected(_)) => return Ended::Lost("decoder stopped".into()),
                 }
             }
             _ = tick.tick() => {
+                if last_rx.elapsed() > SILENCE {
+                    return Ended::Lost(format!("no data from the host for {} s", SILENCE.as_secs()));
+                }
                 reasm.expire(Instant::now());
                 let st = reasm.stats();
                 let report = fb.report(&st);
@@ -684,8 +760,9 @@ async fn receive(
             m = quic::recv_msg::<v1::ControlMessage>(ctl_rx, MAX_MESSAGE_LEN) => match m {
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::End(e)) })) => {
                     return match v1::EndReason::try_from(e.reason) {
-                        Ok(v1::EndReason::HostEnded) => "The host ended the session.".into(),
-                        _ => "Session ended by host.".into(),
+                        Ok(v1::EndReason::HostEnded) => Ended::ByHost("The host ended the session.".into()),
+                        Ok(v1::EndReason::Reboot) => Ended::Rebooting,
+                        _ => Ended::ByHost("Session ended by host.".into()),
                     };
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::PathSwitched(_)) })) => switched.notify_one(),
@@ -696,9 +773,9 @@ async fn receive(
                     shared.current_display.store(sel.display_id, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => return "host closed the connection".into(),
+                Ok(None) | Err(_) => return Ended::Lost("host closed the connection".into()),
             },
-            _ = &mut *quit => return String::new(),
+            _ = quit.changed() => return Ended::Quit,
         }
     }
 }
@@ -712,7 +789,7 @@ fn idr_request(frame_no: u32) -> v1::ControlMessage {
 
 fn decode_loop(
     rx: mpsc::Receiver<CompleteFrame>,
-    out: latest::Sender<DecodedFrame>,
+    out: Arc<latest::Sender<DecodedFrame>>,
     ctl: tmpsc::UnboundedSender<v1::ControlMessage>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     shared: Arc<Shared>,

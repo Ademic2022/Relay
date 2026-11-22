@@ -166,7 +166,8 @@ fn inject_loop(
         }
         let _s = tracing::trace_span!("inject").entered();
         if let Err(e) = i.inject(&ev) {
-            tracing::debug!("inject {ev:?}: {e}");
+            // FR-40: never log what was typed or clicked, only that it failed.
+            tracing::debug!("input injection failed: {e}");
         }
         let d = received.elapsed();
         stats.0 += 1;

@@ -39,6 +39,9 @@ pub struct Options {
     /// Let the Controller browse and transfer files (FR-26).
     pub files: bool,
     pub server: Option<crate::rdv::Server>,
+    /// Run as the unattended agent (FR-32): system identity, permanent
+    /// password, no Accept prompt.
+    pub unattended: bool,
 }
 
 fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCapturer>> {
@@ -85,10 +88,12 @@ pub fn run(opts: Options) -> anyhow::Result<()> {
     .clone();
     drop(cap);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(serve(opts, display, displays))
+    crate::banner::run_with_banner(move |banner| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(serve(opts, display, displays, banner))
+    })
 }
 
 /// Per-session credentials. The one-time password rotates after every
@@ -121,6 +126,9 @@ struct HostState {
     /// Every display, for the monitor picker (FR-20).
     displays: Vec<relay_capture::DisplayInfo>,
     me: Arc<crate::identity::Me>,
+    /// Unattended configuration (agent mode only).
+    unattended: Option<crate::unattended::Config>,
+    banner: crate::banner::Banner,
     creds: Mutex<Arc<Credentials>>,
     limiters: Mutex<Limiters>,
     /// Held for the whole streaming session: one Controller at a time.
@@ -144,9 +152,37 @@ async fn serve(
     opts: Options,
     display: relay_capture::DisplayInfo,
     displays: Vec<relay_capture::DisplayInfo>,
+    banner: crate::banner::Banner,
 ) -> anyhow::Result<()> {
-    let me = Arc::new(crate::identity::load()?);
-    let (node, control) = quic::node(opts.bind, &me.tls, Some(&[quic::ALPN]))?;
+    let (me, unattended_cfg, bind) = if opts.unattended {
+        let cfg = crate::unattended::load()?.context(
+            "unattended access is not enabled (run `relay unattended setup` as administrator)",
+        )?;
+        let key = relay_crypto::keystore::load_or_create_device_key(
+            crate::unattended::keystore().as_ref(),
+        )?;
+        // FR-38: the moment unattended access is disabled, stop serving.
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if !crate::unattended::enabled() {
+                    crate::logs::audit("unattended access disabled; agent exiting");
+                    std::process::exit(0);
+                }
+            }
+        });
+        // Several agents may come and go (login window, user sessions):
+        // any free port; they are reached by ID.
+        (
+            crate::identity::from_key(key)?,
+            Some(cfg),
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+        )
+    } else {
+        (crate::identity::load()?, None, opts.bind)
+    };
+    let me = Arc::new(me);
+    let (node, control) = quic::node(bind, &me.tls, Some(&[quic::ALPN]))?;
     let node = Arc::new(node);
     let hub = crate::rdv::ControlHub::spawn(control);
     let creds = Credentials::new()?;
@@ -172,7 +208,11 @@ async fn serve(
             ),
         }
     }
-    println!("  Password      {}", creds.otp.as_str());
+    if opts.unattended {
+        println!("  Mode          unattended (permanent password)");
+    } else {
+        println!("  Password      {}", creds.otp.as_str());
+    }
     let port = node.endpoint.local_addr()?.port();
     for c in crate::rdv::local_candidates(&node) {
         let ip = c
@@ -198,6 +238,8 @@ async fn serve(
         display: display.clone(),
         displays,
         me: me.clone(),
+        unattended: unattended_cfg,
+        banner,
         creds: Mutex::new(Arc::new(creds)),
         limiters: Mutex::new(limiters),
         streaming: tokio::sync::Mutex::new(()),
@@ -306,12 +348,28 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         let a = l.ip.record_failure(&ip, now);
         a.max(l.key.record_failure(&peer.key, now))
     };
-    let result = auth::host_login(conn, &mut tx, &mut rx, me, &peer, &creds.verifier).await;
-    match result {
-        Ok(auth::HostAuth::Ok) => {
+    // The agent only takes the permanent password; an attended host only
+    // its one-time password (FR-31, FR-2).
+    let result = auth::host_login(conn, &mut tx, &mut rx, me, &peer, |kind| {
+        match (kind, &st.unattended) {
+            (v1::PasswordKind::Permanent, Some(cfg)) => Some(&cfg.verifier),
+            (v1::PasswordKind::OneTime, None) => Some(&creds.verifier),
+            _ => None,
+        }
+    })
+    .await;
+    let unattended = match result {
+        Ok(auth::HostAuth::Ok(kind)) => {
             let mut l = st.limiters.lock().expect("poisoned");
             l.ip.record_success(&ip);
             l.key.record_success(&peer.key);
+            kind == v1::PasswordKind::Permanent
+        }
+        Ok(auth::HostAuth::NotAccepted(kind)) => {
+            audit(&format!(
+                "REFUSED {name}: {kind:?} password not accepted here"
+            ));
+            return reject(&mut tx, v1::AuthResult::BadPassword, 0).await;
         }
         Ok(auth::HostAuth::BadPassword) | Err(_) => {
             audit(&format!("FAILED login from {name}"));
@@ -325,6 +383,11 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 None => reject(&mut tx, v1::AuthResult::BadPassword, 0).await,
             };
         }
+    };
+    // Allow-list (FR-31), checked after the password so it reveals nothing.
+    if unattended && st.unattended.as_ref().is_some_and(|c| !c.allows(peer.id)) {
+        audit(&format!("REFUSED {name}: not on the allow-list"));
+        return reject(&mut tx, v1::AuthResult::NotWhitelisted, 0).await;
     }
 
     // One session (and one consent dialog) at a time.
@@ -334,7 +397,8 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     };
 
     // FR-8: an attended session needs the local user's explicit yes.
-    if !crate::consent::ask(&name).await {
+    // FR-33: unattended sessions skip it (the banner still shows).
+    if !unattended && !crate::consent::ask(&name).await {
         audit(&format!("DECLINED {name}"));
         println!("  ○ Declined {name}.");
         return reject(&mut tx, v1::AuthResult::Declined, 0).await;
@@ -361,7 +425,10 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     };
 
     let started = Instant::now();
-    audit(&format!("SESSION START {name} (attended)"));
+    audit(&format!(
+        "SESSION START {name} ({})",
+        if unattended { "unattended" } else { "attended" }
+    ));
     println!(
         "  ● {} by {name}. Press Ctrl+C to end the session.",
         if opts.view_only {
@@ -370,6 +437,12 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             "Being viewed and controlled"
         }
     );
+    // FR-9 / FR-33: the banner shows whenever someone is at the Host,
+    // attended or not. The Controller has no way to hide it.
+    let banner_shown = !unattended || relay_service::console_user_present();
+    if banner_shown {
+        st.banner.show(&name);
+    }
 
     let (w, h) = (display.width & !1, display.height & !1);
     quic::send_msg(
@@ -527,6 +600,32 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::AbrFeedback(fb)) })) => {
                     control_state.on_feedback(&fb, &shared);
                 }
+                // FR-34: remote reboot, unattended sessions with control only.
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::Power(p)) })) => {
+                    let safe = p.action == v1::PowerAction::RebootSafeMode as i32;
+                    if unattended && !opts.view_only {
+                        audit(&format!("REBOOT{} requested by {name}", if safe { " (safe mode)" } else { "" }));
+                        let _ = quic::send_msg(&mut tx, &control(Msg::End(v1::SessionEnd {
+                            reason: v1::EndReason::Reboot as i32,
+                            detail: String::new(),
+                        }))).await;
+                        let _ = tx.finish();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Err(e) = relay_service::reboot(safe) {
+                            tracing::error!("reboot failed: {e}");
+                        }
+                        break "host rebooting";
+                    }
+                }
+                // FR-14: Ctrl+Alt+Del, performed by the Windows service.
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::SendSas(_)) })) => {
+                    if unattended && !opts.view_only {
+                        match relay_service::send_sas() {
+                            Ok(()) => audit(&format!("CTRL+ALT+DEL sent by {name}")),
+                            Err(e) => tracing::warn!("Ctrl+Alt+Del: {e}"),
+                        }
+                    }
+                }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::SelectMonitor(sel)) })) => {
                     // FR-21: switch the captured display; only it is encoded.
                     if let Some(d) = st.displays.iter().find(|d| d.id == sel.display_id) {
@@ -554,12 +653,24 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                 quit = true;
                 break "ended by host (Ctrl+C)";
             }
+            // FR-10: the Host user clicked "End session" on the banner.
+            _ = crate::banner::end_requested().notified() => {
+                let _ = quic::send_msg(&mut tx, &control(Msg::End(v1::SessionEnd {
+                    reason: v1::EndReason::HostEnded as i32,
+                    detail: String::new(),
+                }))).await;
+                let _ = tx.finish();
+                break "ended by host";
+            }
             e = conn.closed() => {
                 tracing::debug!("connection closed: {e}");
                 break "connection closed";
             }
         }
     };
+    if banner_shown {
+        st.banner.hide();
+    }
     shared.stop.store(true, Ordering::Relaxed);
     if let Some(e) = &relayed {
         st.node.paths.clear(e.relay);
@@ -623,11 +734,7 @@ fn hostname() -> String {
 }
 
 fn audit(line: &str) {
-    // FR-39 stand-in: the durable, tamper-resistant audit log lands in M7.
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    eprintln!("  [audit {ts}] {line}");
+    crate::logs::audit(line);
 }
 
 /// Best-effort list of this machine's LAN addresses for the banner.

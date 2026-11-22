@@ -9,7 +9,7 @@
 //! - Fit-to-window with letterboxing, computed per frame.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use relay_codec::{DecodedFrame, DecodedImage};
 use relay_input::keymap::ModifierMapper;
@@ -87,7 +87,7 @@ struct Gpu {
 
 pub struct App {
     shared: Arc<Shared>,
-    quit: Option<tokio::sync::oneshot::Sender<()>>,
+    quit: tokio::sync::watch::Sender<bool>,
     gpu: Option<Gpu>,
     status: String,
     close_reason: Option<String>,
@@ -102,6 +102,10 @@ pub struct App {
     chat: Chat,
     files: FileManager,
     files_tx: tokio::sync::mpsc::UnboundedSender<FileCmd>,
+    /// Restart requested once; a second press within 3 s confirms.
+    pending_power: Option<(Instant, bool)>,
+    /// Short message shown at the start of the title.
+    notice: Option<(Instant, String)>,
 }
 
 /// In-window chat (FR-24).
@@ -327,7 +331,7 @@ impl Meter {
 impl App {
     pub fn new(
         shared: Arc<Shared>,
-        quit: tokio::sync::oneshot::Sender<()>,
+        quit: tokio::sync::watch::Sender<bool>,
         input_tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
         ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
         chat_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -337,6 +341,8 @@ impl App {
         Self {
             files: FileManager::new(),
             files_tx,
+            pending_power: None,
+            notice: None,
             chat: Chat {
                 tx: chat_tx,
                 log: std::collections::VecDeque::new(),
@@ -362,7 +368,7 @@ impl App {
             last_log: Instant::now(),
             presented: 0,
             shared,
-            quit: Some(quit),
+            quit,
             gpu: None,
             status: "Connecting…".into(),
             close_reason: None,
@@ -372,6 +378,11 @@ impl App {
 
     pub fn close_reason(&self) -> Option<&str> {
         self.close_reason.as_deref().filter(|s| !s.is_empty())
+    }
+
+    fn notify(&mut self, text: &str) {
+        self.notice = Some((Instant::now(), text.to_string()));
+        self.update_title();
     }
 
     fn refresh_files(&mut self) {
@@ -528,6 +539,14 @@ impl App {
         } else {
             format!("Relay — {host} — {}", self.status)
         };
+        let title = match self
+            .notice
+            .as_ref()
+            .filter(|(t, _)| t.elapsed() < Duration::from_secs(3))
+        {
+            Some((_, n)) => format!("{n} · {title}"),
+            None => title,
+        };
         let title = match self.files.summary() {
             Some(t) => format!("{t} · {title}"),
             None => title,
@@ -672,9 +691,7 @@ impl App {
 
     fn end(&mut self, el: &ActiveEventLoop) {
         self.input.release_all();
-        if let Some(q) = self.quit.take() {
-            let _ = q.send(());
-        }
+        let _ = self.quit.send(true);
         el.exit();
     }
 }
@@ -1062,7 +1079,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_title();
             }
             UserEvent::Chat(m) => {
-                tracing::info!("chat from host: {}", m.text);
                 self.chat.push(m.sent_at_ms, false, m.text);
                 if self.chat.compose.is_none() {
                     self.chat.unread += 1;
@@ -1129,6 +1145,44 @@ impl ApplicationHandler<UserEvent> for App {
                             | KeyCode::Digit9),
                         ) => {
                             self.pick_monitor(code);
+                            return;
+                        }
+                        // FR-14: Ctrl+Alt+End sends Ctrl+Alt+Del to a Windows host.
+                        PhysicalKey::Code(KeyCode::End) => {
+                            let _ = self.ui_tx.send(crate::auth::control(
+                                v1::control_message::Msg::SendSas(v1::SendSas {}),
+                            ));
+                            self.notify("Ctrl+Alt+Del sent");
+                            return;
+                        }
+                        // FR-34: Ctrl+Alt+R restarts the host (Shift: Safe Mode).
+                        // Press twice within 3 s to confirm.
+                        PhysicalKey::Code(KeyCode::KeyR) => {
+                            let safe = m.shift_key();
+                            let confirmed = self.pending_power.is_some_and(|(t, s)| {
+                                s == safe && t.elapsed() < Duration::from_secs(3)
+                            });
+                            if confirmed {
+                                self.pending_power = None;
+                                let action = if safe {
+                                    v1::PowerAction::RebootSafeMode
+                                } else {
+                                    v1::PowerAction::Reboot
+                                };
+                                let _ = self.ui_tx.send(crate::auth::control(
+                                    v1::control_message::Msg::Power(v1::PowerRequest {
+                                        action: action as i32,
+                                    }),
+                                ));
+                                self.notify("Restart requested");
+                            } else {
+                                self.pending_power = Some((Instant::now(), safe));
+                                self.notify(if safe {
+                                    "Press Ctrl+Alt+Shift+R again to restart the host in Safe Mode"
+                                } else {
+                                    "Press Ctrl+Alt+R again to restart the host"
+                                });
+                            }
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyF) => {

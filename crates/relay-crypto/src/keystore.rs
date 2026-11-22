@@ -107,3 +107,109 @@ impl Keystore for OsKeystore {
         }
     }
 }
+
+/// Secrets as files in a directory only root / SYSTEM can read (the
+/// unattended agent runs before anyone logs in, when no user keychain is
+/// available). Files are created owner-only (0600 on Unix). On Windows the
+/// caller wraps contents with machine-scope DPAPI via `seal` / `open`.
+pub struct FileKeystore {
+    dir: std::path::PathBuf,
+    seal: fn(&[u8]) -> Result<Vec<u8>, CryptoError>,
+    open: fn(&[u8]) -> Result<Vec<u8>, CryptoError>,
+}
+
+impl std::fmt::Debug for FileKeystore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileKeystore")
+            .field("dir", &self.dir)
+            .finish()
+    }
+}
+
+fn identity(b: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    Ok(b.to_vec())
+}
+
+impl FileKeystore {
+    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self::with_sealing(dir, identity, identity)
+    }
+
+    /// `seal`/`open` encrypt at rest (e.g. Windows DPAPI).
+    pub fn with_sealing(
+        dir: impl Into<std::path::PathBuf>,
+        seal: fn(&[u8]) -> Result<Vec<u8>, CryptoError>,
+        open: fn(&[u8]) -> Result<Vec<u8>, CryptoError>,
+    ) -> Self {
+        Self {
+            dir: dir.into(),
+            seal,
+            open,
+        }
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.join(format!("{name}.secret"))
+    }
+}
+
+impl Keystore for FileKeystore {
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>, CryptoError> {
+        match std::fs::read(self.path(name)) {
+            Ok(b) => (self.open)(&b).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CryptoError::Keystore(e.to_string())),
+        }
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), CryptoError> {
+        use std::io::Write;
+        let err = |e: std::io::Error| CryptoError::Keystore(e.to_string());
+        std::fs::create_dir_all(&self.dir).map_err(err)?;
+        let sealed = (self.seal)(secret)?;
+        let tmp = self.dir.join(format!("{name}.secret.tmp"));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        o.open(&tmp).map_err(err)?.write_all(&sealed).map_err(err)?;
+        std::fs::rename(&tmp, self.path(name)).map_err(err)
+    }
+
+    fn delete(&self, name: &str) -> Result<(), CryptoError> {
+        match std::fs::remove_file(self.path(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CryptoError::Keystore(e.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn file_keystore_round_trip_owner_only() {
+        let d = std::env::temp_dir().join(format!("relay-fks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let ks = FileKeystore::new(&d);
+        assert_eq!(ks.load("k").unwrap(), None);
+        ks.store("k", b"secret").unwrap();
+        assert_eq!(ks.load("k").unwrap().as_deref(), Some(&b"secret"[..]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.join("k.secret"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        ks.delete("k").unwrap();
+        assert_eq!(ks.load("k").unwrap(), None);
+    }
+}

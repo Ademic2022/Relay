@@ -82,6 +82,10 @@ pub fn list(path: &str) -> v1::DirListing {
 
 fn file_op(op: &v1::FileOpRequest) -> Result<(), String> {
     let path = Path::new(&op.path);
+    // FR-39: Relay's own data (audit log, config) is off limits.
+    if crate::logs::is_protected(path) {
+        return Err("that folder belongs to Relay and cannot be changed remotely".into());
+    }
     let r = match v1::FileOp::try_from(op.op).map_err(|_| "unknown operation")? {
         v1::FileOp::Mkdir => std::fs::create_dir(path),
         v1::FileOp::Rename => {
@@ -202,6 +206,10 @@ async fn send_download(
     s: v1::TransferStart,
 ) -> anyhow::Result<()> {
     let path = PathBuf::from(&s.path);
+    if crate::logs::is_protected(&path) {
+        quic::send_msg(tx, &ack(0, "that file belongs to Relay")).await?;
+        return Ok(());
+    }
     let p2 = path.clone();
     let info = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, [u8; 32])> {
         let md = std::fs::metadata(&p2)?;

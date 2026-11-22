@@ -488,14 +488,14 @@ mod tests {
                 let Ok(conn) = i.await else { continue };
                 let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
                 let peer = auth::host_hello(&conn, &mut rx).await.unwrap();
-                match auth::host_login(&conn, &mut tx, &mut rx, &me, &peer, &verifier)
+                match auth::host_login(&conn, &mut tx, &mut rx, &me, &peer, |_| Some(&verifier))
                     .await
                     .unwrap()
                 {
-                    auth::HostAuth::Ok => auth::send_outcome(&mut tx, v1::AuthResult::Ok, 0)
+                    auth::HostAuth::Ok(_) => auth::send_outcome(&mut tx, v1::AuthResult::Ok, 0)
                         .await
                         .unwrap(),
-                    auth::HostAuth::BadPassword => {
+                    auth::HostAuth::BadPassword | auth::HostAuth::NotAccepted(_) => {
                         auth::send_outcome(&mut tx, v1::AuthResult::BadPassword, 0)
                             .await
                             .unwrap();

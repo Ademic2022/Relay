@@ -17,10 +17,24 @@ pub fn control(msg: Msg) -> v1::ControlMessage {
 }
 
 fn auth_msg(step: u32, payload: Vec<u8>) -> v1::ControlMessage {
+    auth_msg_kind(step, payload, v1::PasswordKind::OneTime)
+}
+
+fn auth_msg_kind(step: u32, payload: Vec<u8>, kind: v1::PasswordKind) -> v1::ControlMessage {
     control(Msg::Auth(v1::AuthMessage {
         step,
         payload: payload.into(),
+        password_kind: kind as i32,
     }))
+}
+
+/// One-time passwords are 8 characters; permanent ones 12+ (FR-2, FR-31).
+pub fn kind_of(password: &str) -> v1::PasswordKind {
+    if password.chars().count() >= relay_crypto::password::PERMANENT_MIN_LEN {
+        v1::PasswordKind::Permanent
+    } else {
+        v1::PasswordKind::OneTime
+    }
 }
 
 pub fn local_os() -> v1::OsKind {
@@ -59,7 +73,7 @@ pub async fn controller(
     )
     .await?;
     let (login, ke1) = ControllerLogin::start(password)?;
-    quic::send_msg(tx, &auth_msg(1, ke1)).await?;
+    quic::send_msg(tx, &auth_msg_kind(1, ke1, kind_of(password))).await?;
 
     let ke2 = match quic::recv_msg::<v1::ControlMessage>(rx, MAX_MESSAGE_LEN).await? {
         Some(v1::ControlMessage {
@@ -150,18 +164,21 @@ pub async fn host_hello(conn: &Connection, rx: &mut RecvStream) -> anyhow::Resul
 
 /// Result of the password exchange on the host.
 pub enum HostAuth {
-    Ok,
+    Ok(v1::PasswordKind),
     BadPassword,
+    /// No password of the kind the Controller used is set on this Host.
+    NotAccepted(v1::PasswordKind),
 }
 
-/// Host side, step 2: run OPAQUE against `password`.
-pub async fn host_login(
+/// Host side, step 2: run OPAQUE against the verifier `pick` returns for
+/// the kind of password the Controller says it is using.
+pub async fn host_login<'a>(
     conn: &Connection,
     tx: &mut SendStream,
     rx: &mut RecvStream,
     me: &crate::identity::Me,
     peer: &Peer,
-    password: &HostPassword,
+    pick: impl FnOnce(v1::PasswordKind) -> Option<&'a HostPassword>,
 ) -> anyhow::Result<HostAuth> {
     let exporter = quic::exporter(conn)?;
     let my_key = me.public_key();
@@ -169,11 +186,18 @@ pub async fn host_login(
         controller_pubkey: &peer.key,
         host_pubkey: &my_key,
     };
-    let ke1 = match quic::recv_msg::<v1::ControlMessage>(rx, MAX_AUTH_MSG).await? {
+    let (ke1, kind) = match quic::recv_msg::<v1::ControlMessage>(rx, MAX_AUTH_MSG).await? {
         Some(v1::ControlMessage {
             msg: Some(Msg::Auth(a)),
-        }) if a.step == 1 => a.payload,
+        }) if a.step == 1 => {
+            let kind =
+                v1::PasswordKind::try_from(a.password_kind).unwrap_or(v1::PasswordKind::OneTime);
+            (a.payload, kind)
+        }
         _ => bail!("expected KE1"),
+    };
+    let Some(password) = pick(kind) else {
+        return Ok(HostAuth::NotAccepted(kind));
     };
     let (login, ke2): (HostLogin, Vec<u8>) = password.start_login(&ke1, parties, &exporter)?;
     quic::send_msg(tx, &auth_msg(2, ke2)).await?;
@@ -184,7 +208,7 @@ pub async fn host_login(
         _ => bail!("expected KE3"),
     };
     Ok(match login.finish(&ke3, parties, &exporter) {
-        Ok(_) => HostAuth::Ok,
+        Ok(_) => HostAuth::Ok(kind),
         Err(_) => HostAuth::BadPassword,
     })
 }

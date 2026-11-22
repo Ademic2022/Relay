@@ -106,6 +106,40 @@ impl HostPassword {
         Ok(Self { setup, file, kind })
     }
 
+    /// Serialise for storage (permanent passwords, FR-31). Holds the
+    /// OPAQUE server secrets and password file, never the password; keep
+    /// it where only root / SYSTEM can read it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let setup = self.setup.serialize();
+        let file = self.file.serialize();
+        let mut out = vec![1u8, matches!(self.kind, PasswordKind::Permanent) as u8];
+        out.extend_from_slice(&(setup.len() as u32).to_le_bytes());
+        out.extend_from_slice(&setup);
+        out.extend_from_slice(&file);
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, PakeError> {
+        if b.len() < 6 || b[0] != 1 {
+            return Err(PakeError::Malformed);
+        }
+        let kind = if b[1] == 1 {
+            PasswordKind::Permanent
+        } else {
+            PasswordKind::OneTime
+        };
+        let n = u32::from_le_bytes(b[2..6].try_into().map_err(|_| PakeError::Malformed)?) as usize;
+        let setup_bytes = b.get(6..6 + n).ok_or(PakeError::Malformed)?;
+        let file_bytes = b.get(6 + n..).ok_or(PakeError::Malformed)?;
+        Ok(Self {
+            setup: ServerSetup::<Suite>::deserialize(setup_bytes)
+                .map_err(|_| PakeError::Malformed)?,
+            file: ServerRegistration::<Suite>::deserialize(file_bytes)
+                .map_err(|_| PakeError::Malformed)?,
+            kind,
+        })
+    }
+
     /// Handle `KE1`; returns the in-progress login and `KE2`.
     pub fn start_login(
         &self,
@@ -286,6 +320,22 @@ mod tests {
             run("Ab3dEf7h", "Ab3dEf7h", b"exporter", p),
             Err(PakeError::BadPassword)
         );
+    }
+
+    #[test]
+    fn stored_verifier_still_checks_the_password() {
+        let hp = HostPassword::new("correct horse battery", PasswordKind::Permanent).unwrap();
+        let stored = hp.to_bytes();
+        assert!(!stored.windows(7).any(|w| w == b"correct"), "no plaintext");
+        let hp = HostPassword::from_bytes(&stored).unwrap();
+        assert_eq!(hp.kind, PasswordKind::Permanent);
+        let (cl, ke1) = ControllerLogin::start("correct horse battery").unwrap();
+        let (hl, ke2) = hp.start_login(&ke1, parties(), b"x").unwrap();
+        let (ke3, _) = cl
+            .finish("correct horse battery", &ke2, parties(), b"x")
+            .unwrap();
+        hl.finish(&ke3, parties(), b"x").unwrap();
+        assert!(HostPassword::from_bytes(&stored[..10]).is_err());
     }
 
     #[test]
