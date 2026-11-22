@@ -405,6 +405,17 @@ async fn reconnecting(
                 let _ =
                     proxy.send_event(UserEvent::Status("Connection lost — reconnecting…".into()));
             }
+            // One-time passwords change after every session, and a refusal
+            // will not change on retry: stop instead of hammering the host.
+            Err(e) if e.downcast_ref::<crate::auth::Refused>().is_some() => {
+                return if deadline.is_some() {
+                    format!(
+                        "Could not reconnect: {e:#}. If the host uses a one-time password, ask for the new one."
+                    )
+                } else {
+                    format!("{e:#}")
+                };
+            }
             Err(e) => match deadline {
                 Some(d) if now < d => {
                     tracing::debug!("reconnect attempt: {e:#}");

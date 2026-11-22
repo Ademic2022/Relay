@@ -239,7 +239,9 @@ extern "C" fn on_output(
             "encode callback: OSStatus {status}"
         )))
     } else if sample.is_null() {
-        Err(CodecError::Platform("encoder dropped the frame".into()))
+        // VideoToolbox may drop a frame (real-time rate control, large
+        // frames). Not an error: empty data = skipped, like openh264.
+        Ok((Vec::new(), false))
     } else {
         // SAFETY: sample is a valid CMSampleBuffer for this callback.
         unsafe { to_annex_b(sample) }
@@ -514,7 +516,8 @@ impl Encoder for VideoToolboxEncoder {
             .lock()
             .expect("poisoned")
             .take()
-            .ok_or_else(|| CodecError::Platform("no output after CompleteFrames".into()))??;
+            // No callback for this frame: it was dropped; skip it.
+            .unwrap_or_else(|| Ok((Vec::new(), false)))?;
         Ok(EncodedFrame {
             data: Bytes::from(data),
             is_key,

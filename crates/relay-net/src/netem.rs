@@ -229,10 +229,27 @@ mod tests {
         for _ in 0..1000 {
             c.send_to(&[0u8; 1000], addr).await.unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let s = *stats.up.lock().unwrap();
+        // Wait until the emulator has read everything that reached it.
+        let mut last = 0;
+        let s = loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let s = *stats.up.lock().unwrap();
+            let seen = s.forwarded + s.queue_dropped;
+            if seen == last {
+                break s;
+            }
+            last = seen;
+        };
         // 100 ms of queue at 1 Mbit/s ≈ 12.5 KB ≈ 13 packets.
         assert!(s.forwarded < 30, "forwarded {}", s.forwarded);
-        assert!(s.queue_dropped > 900);
+        // Not `> 900`: the OS may drop much of the burst before the emulator
+        // reads it (Windows' default UDP receive buffer is ~64 KB), so only
+        // require that most of what arrived was shed by the queue.
+        assert!(
+            s.queue_dropped > 2 * s.forwarded,
+            "queue_dropped {} vs forwarded {}",
+            s.queue_dropped,
+            s.forwarded
+        );
     }
 }

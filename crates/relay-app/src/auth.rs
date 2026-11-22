@@ -12,6 +12,21 @@ use relay_proto::{MAX_MESSAGE_LEN, PROTOCOL_VERSION};
 
 const MAX_AUTH_MSG: usize = 4096;
 
+/// The host refused us (wrong password, declined, locked out, not on the
+/// allow-list). Retrying with the same password cannot help, so the
+/// viewer's reconnect loop stops on this (and does not feed the host's
+/// brute-force counter).
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 pub fn control(msg: Msg) -> v1::ControlMessage {
     v1::ControlMessage { msg: Some(msg) }
 }
@@ -93,7 +108,7 @@ pub async fn controller(
         Err(PakeError::BadPassword) => {
             // Tell the host so it counts the failure (FR-35).
             let _ = quic::send_msg(tx, &auth_msg(3, Vec::new())).await;
-            bail!("wrong password");
+            return Err(Refused("wrong password".into()).into());
         }
         Err(e) => bail!("authentication failed: {e}"),
     };
@@ -110,16 +125,17 @@ pub async fn controller(
 }
 
 fn outcome_error(o: &v1::AuthOutcome) -> anyhow::Error {
-    match v1::AuthResult::try_from(o.result).unwrap_or(v1::AuthResult::Unspecified) {
-        v1::AuthResult::BadPassword => anyhow::anyhow!("wrong password"),
-        v1::AuthResult::LockedOut => anyhow::anyhow!(
+    let msg = match v1::AuthResult::try_from(o.result).unwrap_or(v1::AuthResult::Unspecified) {
+        v1::AuthResult::BadPassword => "wrong password".to_string(),
+        v1::AuthResult::LockedOut => format!(
             "too many attempts; try again in {} s",
             o.retry_after_ms.div_ceil(1000)
         ),
-        v1::AuthResult::Declined => anyhow::anyhow!("the host declined the connection"),
-        v1::AuthResult::NotWhitelisted => anyhow::anyhow!("this device is not allowed to connect"),
-        other => anyhow::anyhow!("host refused the connection: {other:?}"),
-    }
+        v1::AuthResult::Declined => "the host declined the connection".into(),
+        v1::AuthResult::NotWhitelisted => "this device is not allowed to connect".into(),
+        other => format!("host refused the connection: {other:?}"),
+    };
+    Refused(msg).into()
 }
 
 /// What the host learned about the controller.
