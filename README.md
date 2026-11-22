@@ -126,7 +126,9 @@ key, owner-only, in `/Library/Application Support/Relay` (macOS) or `%ProgramDat
   screen at power-on runs before macOS and cannot be reached.
 
 Connect with `relay connect <ID>` and the permanent password: no Accept prompt, but the red
-"Being controlled by …" banner still shows whenever someone is logged in (FR-33). From the
+"Being controlled by …" banner still shows whenever someone is logged in (FR-33). The host user
+can end any session with the banner's **End session** button or the global hotkey
+**Ctrl+Alt+Shift+X** (⌃⌥⇧X on macOS; FR-10), active only while a session runs. From the
 viewer, `Ctrl+Alt+R` twice restarts the host (`Ctrl+Alt+Shift+R`: Safe Mode, Windows) and
 `Ctrl+Alt+End` sends Ctrl+Alt+Del; the viewer shows "Waiting for device…" and reconnects.
 

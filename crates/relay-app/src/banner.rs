@@ -3,7 +3,8 @@
 //! A small borderless, always-on-top window at the top of the screen:
 //! `*  Being controlled by alice (ID 123 456 789)   [ End session ]`.
 //! Only the Host user can close it; nothing the Controller sends affects
-//! it. Clicking "End session" (or closing the window) ends the session.
+//! it. Clicking "End session" (or closing the window) ends the session, and
+//! so does the global hotkey Ctrl+Alt+Shift+X / ⌃⌥⇧X while it is shown.
 //!
 //! Drawn with `softbuffer` (CPU pixels; no GPU needed on the Host) and the
 //! 8×8 bitmap font. If no window can be created (no GUI session), the
@@ -64,6 +65,11 @@ pub fn end_requested() -> &'static tokio::sync::Notify {
 }
 
 const BUTTON: &str = "[ End session ]";
+/// FR-10 hint, after (not part of) the clickable button.
+#[cfg(target_os = "macos")]
+const HOTKEY_HINT: &str = "or Ctrl+Opt+Shift+X";
+#[cfg(not(target_os = "macos"))]
+const HOTKEY_HINT: &str = "or Ctrl+Alt+Shift+X";
 const BG: u32 = 0x00B0_2020; // red: impossible to miss
 const FG: u32 = 0x00FF_FFFF;
 
@@ -76,7 +82,7 @@ pub fn banner_text(who: &str) -> (String, usize) {
         .collect();
     let left = format!("  *  Being controlled by {who}    ");
     let start = left.chars().count();
-    (format!("{left}{BUTTON}  "), start)
+    (format!("{left}{BUTTON}  {HOTKEY_HINT}  "), start)
 }
 
 /// Rasterise one line into 0RGB pixels at `scale`. Returns (pixels, w, h).
@@ -107,6 +113,18 @@ struct App {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     text: Option<(String, usize)>,
     cursor_x: f64,
+    /// FR-10; `None` if it could not be registered (the button still works).
+    hotkey: Option<relay_input::hotkey::SessionHotkey>,
+}
+
+impl App {
+    fn hotkey(&mut self, on: bool) {
+        if let Some(h) = &mut self.hotkey
+            && let Err(e) = h.set_active(on)
+        {
+            tracing::warn!("{e}");
+        }
+    }
 }
 
 impl App {
@@ -180,8 +198,10 @@ impl ApplicationHandler<BannerEvent> for App {
                 }
                 self.place(el);
                 self.draw();
+                self.hotkey(true);
             }
             BannerEvent::Hide => {
+                self.hotkey(false);
                 self.text = None;
                 if let Some(w) = &self.window {
                     w.set_visible(false);
@@ -246,6 +266,10 @@ where
         surface: None,
         text: None,
         cursor_x: 0.0,
+        // Created on the main thread: macOS delivers hot keys on its run loop.
+        hotkey: relay_input::hotkey::SessionHotkey::new(Box::new(|| end_requested().notify_one()))
+            .map_err(|e| tracing::warn!("end-session hotkey unavailable: {e}"))
+            .ok(),
     };
     event_loop.run_app(&mut app)?;
     worker
@@ -263,6 +287,10 @@ mod tests {
         assert!(t.contains("Being controlled by alice"));
         assert!(!t.contains('\u{1b}'), "control characters stripped");
         assert_eq!(&t[start..start + BUTTON.len()], BUTTON);
+        assert!(
+            t.ends_with(&format!("{HOTKEY_HINT}  ")),
+            "hotkey hint shown (FR-10)"
+        );
         let (px, w, h) = render(&t, 2);
         assert_eq!(px.len(), (w * h) as usize);
         assert!(px.contains(&FG) && px.contains(&BG));

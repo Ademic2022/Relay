@@ -6,6 +6,7 @@
 //! maps HID usage to its native scancode / virtual keycode.
 
 pub mod hid;
+pub mod hotkey;
 pub mod keymap;
 #[cfg(target_os = "macos")]
 pub mod macos;
