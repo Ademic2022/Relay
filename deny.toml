@@ -29,6 +29,11 @@ allow = [
   # Boost Software License 1.0: permissive, OSI-approved (clipboard-win via
   # arboard). Not to be confused with the Business Source License.
   "BSL-1.0",
+  # Mozilla Public License 2.0: file-level copyleft. Only via Tauri's HTML
+  # tooling (cssparser, selectors, dtoa-short from Servo) and option-ext.
+  # Shipping them unmodified is fine; changes to *their* files would have to
+  # be published. We do not vendor or patch them.
+  "MPL-2.0",
 ]
 
 [bans]

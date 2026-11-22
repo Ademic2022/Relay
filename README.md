@@ -135,6 +135,22 @@ viewer, `Ctrl+Alt+R` twice restarts the host (`Ctrl+Alt+Shift+R`: Safe Mode, Win
 Every connection is recorded: `relay audit` (`--unattended` for the agent's log).
 Diagnostic logs (10 MB cap, no screen content or keystrokes): `relay logs`.
 
+## The Relay app
+
+`app/` is the desktop app (Tauri 2, PRD §5.1): your ID or address and password, Connect,
+recent devices, the Accept/Decline prompt, the active session with chat and End session,
+the connection log and settings. It drives the `relay` engine next to it (`relay host --ui`
+over stdin/stdout JSON lines; viewers start as `relay connect|view --password-stdin`). The
+remote screen opens in the native wgpu window, never in the webview.
+
+```sh
+cargo build --release -p relay-app -p relay-ui
+./target/release/relay-app
+```
+
+The UI is plain HTML/CSS/JS in `app/ui/` (no bundler), type-checked with
+`npx -p typescript tsc --noEmit --allowJs --checkJs --strict --noImplicitAny false --lib dom,dom.iterable,es2022 app/ui/*.js`.
+
 ## Settings, updates, installers (M8)
 
 - `relay config list | get KEY | set KEY VALUE | unset KEY`: server, server_key, quality,
