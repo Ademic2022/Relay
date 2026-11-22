@@ -17,6 +17,7 @@ rustls.workspace = true
 rcgen.workspace = true
 tokio.workspace = true
 blake3.workspace = true
+reed-solomon-simd = "3.1"
 
 
 [lints]

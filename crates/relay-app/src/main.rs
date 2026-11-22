@@ -18,14 +18,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 mod auth;
 mod clock;
 mod consent;
+mod feedback;
 mod host;
 mod host_input;
 mod identity;
 mod input_wire;
 mod migrate;
+#[cfg(test)]
+mod netem_tests;
 mod pins;
 mod rdv;
 mod rt;
+mod sender;
 mod viewer;
 
 /// Default port for direct (no-rendezvous) connections.
@@ -90,6 +94,19 @@ struct ViewerArgs {
     /// keyboard layouts (FR-14).
     #[arg(long)]
     translate_chars: bool,
+    /// Starting quality mode; Ctrl+Alt+Q cycles it in the viewer.
+    #[arg(long, value_enum, default_value_t = Quality::Speed)]
+    quality: Quality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[allow(clippy::enum_variant_names)] // CLI spelling: --quality quality
+enum Quality {
+    /// Lowest latency (default).
+    Speed,
+    Balanced,
+    /// Higher bitrate and resolution held longer (design work).
+    Quality,
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +231,11 @@ fn run_viewer(target: viewer::Target, v: ViewerArgs, force_relay: bool) -> anyho
         measure: v.measure,
         cmd_ctrl_swap: !v.no_cmd_ctrl_swap,
         translate_chars: v.translate_chars,
+        quality: match v.quality {
+            Quality::Speed => relay_proto::v1::QualityMode::Speed,
+            Quality::Balanced => relay_proto::v1::QualityMode::Balanced,
+            Quality::Quality => relay_proto::v1::QualityMode::Quality,
+        },
     })
 }
 

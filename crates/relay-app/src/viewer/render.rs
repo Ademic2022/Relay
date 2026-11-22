@@ -21,7 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use super::{Shared, UserEvent, ViewOptions, keys};
+use super::{Shared, UserEvent, ViewOptions, keys, overlay::Overlay};
 
 const SHADER: &str = r#"
 struct Uniforms { scale: vec2<f32>, _pad: vec2<f32> };
@@ -79,6 +79,7 @@ struct Gpu {
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
     planes: Option<Planes>,
+    overlay: Overlay,
 }
 
 pub struct App {
@@ -93,6 +94,8 @@ pub struct App {
     presented: u32,
     input: InputState,
     cursor: RemoteCursor,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
+    quality: v1::QualityMode,
 }
 
 /// The Host's pointer, shown as the local OS cursor (§6 rule 5): the
@@ -256,9 +259,12 @@ impl App {
         shared: Arc<Shared>,
         quit: tokio::sync::oneshot::Sender<()>,
         input_tx: tokio::sync::mpsc::UnboundedSender<v1::InputEvent>,
+        ui_tx: tokio::sync::mpsc::UnboundedSender<v1::ControlMessage>,
         opts: &ViewOptions,
     ) -> Self {
         Self {
+            ui_tx,
+            quality: opts.quality,
             input: InputState {
                 tx: input_tx,
                 swap_cmd_ctrl: opts.cmd_ctrl_swap,
@@ -288,7 +294,32 @@ impl App {
         self.close_reason.as_deref().filter(|s| !s.is_empty())
     }
 
+    fn update_overlay(&mut self) {
+        let Some(g) = &mut self.gpu else { return };
+        if !g.overlay.visible {
+            return;
+        }
+        let s = self.shared.stats.lock().expect("poisoned").clone();
+        let (w, h) = g.planes.as_ref().map_or((0, 0), |p| (p.w, p.h));
+        let lines = vec![
+            format!("{:.0} fps  {:.2} Mbit/s  {w}x{h}", s.fps, s.mbps),
+            format!(
+                "RTT {:.0} ms  queue {:.0} ms  {}",
+                s.rtt_ms, s.queue_ms, s.path
+            ),
+            format!(
+                "loss {:.1}%  FEC-recovered {}  dropped {}",
+                s.loss_pct, s.recovered, s.dropped
+            ),
+            format!("decode {:.1} ms  mode {:?}", s.decode_ms, self.quality),
+            "Ctrl+Alt+S stats  Ctrl+Alt+Q quality".to_string(),
+        ];
+        let scale = g.window.scale_factor().round().max(1.0) as usize;
+        g.overlay.set_text(&g.device, &g.queue, &lines, scale);
+    }
+
     fn update_title(&mut self) {
+        self.update_overlay();
         let Some(gpu) = &self.gpu else { return };
         let host = self.shared.host_name.lock().expect("poisoned").clone();
         let title = if gpu.planes.is_some() {
@@ -561,6 +592,7 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let overlay = Overlay::new(&device, format);
         Ok(Self {
             window,
             surface,
@@ -572,6 +604,7 @@ impl Gpu {
             sampler,
             uniforms,
             planes: None,
+            overlay,
         })
     }
 
@@ -730,6 +763,12 @@ impl Gpu {
                 pass.set_bind_group(0, &p.bind, &[]);
                 pass.draw(0..6, 0..1);
             }
+            self.overlay.draw(
+                &self.queue,
+                &mut pass,
+                self.config.width as f32,
+                self.config.height as f32,
+            );
         }
         self.queue.submit([enc.finish()]);
         self.window.pre_present_notify();
@@ -824,8 +863,40 @@ impl ApplicationHandler<UserEvent> for App {
                 is_synthetic,
                 ..
             } => {
-                // Local shortcut, never sent: Ctrl+Alt+Enter toggles full screen.
+                // Local shortcuts, never sent to the host:
+                // Ctrl+Alt+S stats overlay, Ctrl+Alt+Q quality mode.
                 let m = self.input.mods;
+                if event.state == ElementState::Pressed && m.control_key() && m.alt_key() {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyS) => {
+                            if let Some(g) = &mut self.gpu {
+                                g.overlay.visible = !g.overlay.visible;
+                            }
+                            self.update_overlay();
+                            if let Some(g) = &mut self.gpu {
+                                g.draw();
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyQ) => {
+                            self.quality = match self.quality {
+                                v1::QualityMode::Speed => v1::QualityMode::Balanced,
+                                v1::QualityMode::Balanced => v1::QualityMode::Quality,
+                                v1::QualityMode::Quality => v1::QualityMode::Speed,
+                            };
+                            let _ = self.ui_tx.send(crate::auth::control(
+                                v1::control_message::Msg::SetQuality(v1::SetQuality {
+                                    mode: self.quality as i32,
+                                }),
+                            ));
+                            tracing::info!("quality mode {:?}", self.quality);
+                            self.update_overlay();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // Ctrl+Alt+Enter toggles full screen.
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
                     && m.control_key()

@@ -10,24 +10,19 @@
 //! after every session.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
-use relay_capture::CapturedFrame;
-use relay_codec::{Codec, Encoder, EncoderConfig};
+use anyhow::Context;
 use relay_crypto::pake::{HostPassword, PasswordKind};
 use relay_crypto::password::OneTimePassword;
 use relay_net::quic::{self, Connection};
-use relay_net::video::{DEFAULT_MAX_DATAGRAM, FrameMeta, slice_frame};
 use relay_proto::v1::{self, control_message::Msg};
 use relay_proto::{MAX_MESSAGE_LEN, PROTOCOL_VERSION};
-use relay_session::abr::{AbrConfig, AbrController};
 use relay_session::auth_limit::AuthLimiter;
-use relay_session::idr::IdrLimiter;
 
-use crate::{CodecChoice, clock, rt};
+use crate::{CodecChoice, rt};
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -41,9 +36,6 @@ pub struct Options {
     pub view_only: bool,
     pub server: Option<crate::rdv::Server>,
 }
-
-/// Keep-alive cadence when the screen is static (§6 rule 4).
-const KEEPALIVE: Duration = Duration::from_secs(1);
 
 fn capturer(opts: &Options) -> anyhow::Result<Box<dyn relay_capture::ScreenCapturer>> {
     Ok(match opts.test_pattern {
@@ -455,12 +447,10 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
     )
     .await?;
 
-    let shared = Arc::new(PipelineShared {
-        stop: AtomicBool::new(false),
-        force_key: AtomicBool::new(true),
-        bitrate_kbps: AtomicU32::new(opts.bitrate_kbps),
-        error: Mutex::new(None),
-    });
+    let shared = Arc::new(crate::sender::SenderControl::new(
+        opts.bitrate_kbps,
+        opts.fps,
+    ));
     let pipeline = {
         let shared = shared.clone();
         let conn = conn.clone();
@@ -471,18 +461,22 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
             .name("relay-encode".into())
             .spawn(move || {
                 rt::set_realtime();
-                if let Err(e) = pipeline(&conn, &opts, display_id, w, h, &shared, &cursor_tx) {
+                let params = crate::sender::SenderParams {
+                    codec: opts.codec,
+                    max_fps: opts.fps,
+                    cpu_source: opts.test_pattern.is_some() && !cfg!(target_os = "macos"),
+                };
+                let res = capturer(&opts).and_then(|cap| {
+                    crate::sender::run(&conn, cap, display_id, params, &shared, Some(&cursor_tx))
+                });
+                if let Err(e) = res {
                     *shared.error.lock().expect("poisoned") = Some(format!("{e:#}"));
                     conn.close(2u32.into(), b"host pipeline error");
                 }
             })?
     };
 
-    let mut idr = IdrLimiter::default();
-    let mut abr = AbrController::new(AbrConfig {
-        start_kbps: opts.bitrate_kbps,
-        ..AbrConfig::SPEED_1080P
-    });
+    let mut control_state = crate::sender::ControlState::new(opts.bitrate_kbps);
     let mut quit = false;
     let reason = loop {
         tokio::select! {
@@ -495,18 +489,15 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
                     }
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::IdrRequest(_)) })) => {
-                    if idr.request(Instant::now()) {
-                        shared.force_key.store(true, Ordering::Relaxed);
-                    }
+                    control_state.on_idr_request(&shared);
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::AbrFeedback(fb)) })) => {
-                    if idr.poll(Instant::now()) {
-                        shared.force_key.store(true, Ordering::Relaxed);
-                    }
-                    if let Some(t) = abr.on_feedback(&fb) {
-                        // M1 applies bitrate only; fps/scale steps land in M4.
-                        shared.bitrate_kbps.store(t.bitrate_kbps, Ordering::Relaxed);
-                    }
+                    control_state.on_feedback(&fb, &shared);
+                }
+                Ok(Some(v1::ControlMessage { msg: Some(Msg::SetQuality(q)) })) => {
+                    let mode = v1::QualityMode::try_from(q.mode).unwrap_or(v1::QualityMode::Speed);
+                    control_state.set_mode(mode, &shared);
+                    println!("  Quality mode: {mode:?}");
                 }
                 Ok(Some(v1::ControlMessage { msg: Some(Msg::End(_)) })) | Ok(None) => break "viewer disconnected",
                 Ok(Some(_)) => {}
@@ -547,243 +538,6 @@ async fn session(conn: &Connection, st: &HostState) -> anyhow::Result<SessionOut
         started.elapsed().as_secs()
     ));
     Ok(SessionOutcome::Ended { quit })
-}
-
-struct PipelineShared {
-    stop: AtomicBool,
-    force_key: AtomicBool,
-    bitrate_kbps: AtomicU32,
-    error: Mutex<Option<String>>,
-}
-
-fn make_encoder(
-    choice: CodecChoice,
-    cfg: EncoderConfig,
-    test_pattern: bool,
-) -> anyhow::Result<Box<dyn Encoder>> {
-    // On Windows the test pattern lives in system memory, not a D3D11
-    // texture, so it goes through the software encoder.
-    let choice = if test_pattern && !cfg!(target_os = "macos") && choice == CodecChoice::Auto {
-        CodecChoice::Sw
-    } else {
-        choice
-    };
-    #[cfg(target_os = "windows")]
-    if choice != CodecChoice::Sw {
-        match relay_codec::mediafoundation::MediaFoundationEncoder::new(cfg.clone()) {
-            Ok(e) => {
-                tracing::info!("encoder: Media Foundation (hardware)");
-                return Ok(Box::new(e));
-            }
-            Err(e) if choice == CodecChoice::Hw => bail!("hardware encoder unavailable: {e}"),
-            Err(e) => tracing::warn!("hardware encoder unavailable ({e}); using openh264"),
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if choice != CodecChoice::Sw {
-        match relay_codec::videotoolbox::VideoToolboxEncoder::new(cfg.clone()) {
-            Ok(e) => {
-                tracing::info!("encoder: VideoToolbox (hardware)");
-                return Ok(Box::new(e));
-            }
-            Err(e) if choice == CodecChoice::Hw => bail!("hardware encoder unavailable: {e}"),
-            Err(e) => tracing::warn!("hardware encoder unavailable ({e}); using openh264"),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    if choice == CodecChoice::Hw {
-        bail!("hardware encoder not implemented on this OS yet");
-    }
-    tracing::info!("encoder: openh264 (software)");
-    Ok(Box::new(relay_codec::openh264::OpenH264Encoder::new(cfg)?))
-}
-
-fn pipeline(
-    conn: &Connection,
-    opts: &Options,
-    display_id: u32,
-    w: u32,
-    h: u32,
-    shared: &PipelineShared,
-    cursor_tx: &tokio::sync::mpsc::UnboundedSender<v1::CursorMessage>,
-) -> anyhow::Result<()> {
-    let mut cap = capturer(opts)?;
-    cap.select(display_id)?;
-    let mut enc = make_encoder(
-        opts.codec,
-        EncoderConfig::low_latency(Codec::H264, w, h, opts.fps, opts.bitrate_kbps),
-        opts.test_pattern.is_some(),
-    )?;
-
-    let mut frame_no: u32 = 0;
-    let mut last: Option<CapturedFrame> = None;
-    let mut last_sent = Instant::now();
-    let mut stats = Stats::new();
-    let mut cursor = CursorSync::default();
-
-    while !shared.stop.load(Ordering::Relaxed) {
-        let frame = {
-            let _s = tracing::trace_span!("capture_wait").entered();
-            // Short wait so pointer-only changes are picked up promptly.
-            cap.next_frame(Duration::from_millis(16))?
-        };
-        if let Some(c) = cap.cursor() {
-            cursor.update(&c, cursor_tx);
-        }
-        let (frame, keepalive) = match frame {
-            Some(f) => (f, false),
-            // Static screen: nothing to send except a 1 fps keep-alive.
-            None if last_sent.elapsed() >= KEEPALIVE => match last.clone() {
-                Some(f) => (f, true),
-                None => continue,
-            },
-            None => continue,
-        };
-
-        let kbps = shared.bitrate_kbps.load(Ordering::Relaxed);
-        if kbps != enc.config().bitrate_kbps {
-            enc.set_bitrate(kbps)?;
-        }
-        let force = shared.force_key.swap(false, Ordering::Relaxed);
-        let ts = if keepalive {
-            clock::now_us()
-        } else {
-            clock::us_of(frame.captured_at)
-        };
-        let t_enc = Instant::now();
-        let encoded = {
-            let _s = tracing::trace_span!("encode", frame_no).entered();
-            enc.encode(&frame, ts, force)?
-        };
-        let enc_time = t_enc.elapsed();
-
-        let max = conn
-            .max_datagram_size()
-            .context("peer does not accept datagrams")?
-            .min(DEFAULT_MAX_DATAGRAM);
-        let meta = FrameMeta {
-            stream_id: 0,
-            frame_no,
-            is_key: encoded.is_key,
-            capture_ts_us: ts,
-        };
-        {
-            let _s = tracing::trace_span!("send", bytes = encoded.data.len()).entered();
-            for dg in slice_frame(meta, &encoded.data, max)? {
-                match conn.send_datagram(dg) {
-                    Ok(()) => {}
-                    Err(quinn::SendDatagramError::ConnectionLost(_)) => return Ok(()),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        frame_no = frame_no.wrapping_add(1);
-        last_sent = Instant::now();
-        stats.record(
-            encoded.data.len(),
-            enc_time,
-            frame.captured_at.elapsed(),
-            encoded.is_key,
-        );
-        if !keepalive {
-            last = Some(frame);
-        }
-        stats.maybe_log(kbps);
-    }
-    Ok(())
-}
-
-/// Sends cursor shape/position changes; shapes are sent in full once and
-/// then referenced by hash.
-#[derive(Default)]
-struct CursorSync {
-    known: std::collections::HashSet<u64>,
-    last: Option<(bool, u64, (f32, f32))>,
-}
-
-impl CursorSync {
-    fn update(
-        &mut self,
-        c: &relay_capture::CursorState,
-        tx: &tokio::sync::mpsc::UnboundedSender<v1::CursorMessage>,
-    ) {
-        let hash = c.image.as_ref().map_or(0, |i| i.hash);
-        if let Some(img) = &c.image
-            && self.known.insert(img.hash)
-        {
-            let _ = tx.send(v1::CursorMessage {
-                msg: Some(v1::cursor_message::Msg::Shape(v1::CursorShape {
-                    hash: img.hash,
-                    width: img.width,
-                    height: img.height,
-                    hotspot_x: img.hot_x,
-                    hotspot_y: img.hot_y,
-                    rgba: img.rgba.clone().into(),
-                    scale_milli: img.scale_milli,
-                })),
-            });
-        }
-        let now = (c.visible, hash, (c.x, c.y));
-        if self.last != Some(now) {
-            self.last = Some(now);
-            let _ = tx.send(v1::CursorMessage {
-                msg: Some(v1::cursor_message::Msg::Position(v1::CursorPosition {
-                    x: c.x,
-                    y: c.y,
-                    visible: c.visible,
-                    shape_hash: hash,
-                })),
-            });
-        }
-    }
-}
-
-struct Stats {
-    since: Instant,
-    frames: u32,
-    keys: u32,
-    bytes: usize,
-    enc: Duration,
-    glass_to_send: Duration,
-}
-
-impl Stats {
-    fn new() -> Self {
-        Self {
-            since: Instant::now(),
-            frames: 0,
-            keys: 0,
-            bytes: 0,
-            enc: Duration::ZERO,
-            glass_to_send: Duration::ZERO,
-        }
-    }
-
-    fn record(&mut self, bytes: usize, enc: Duration, capture_to_sent: Duration, key: bool) {
-        self.frames += 1;
-        self.keys += key as u32;
-        self.bytes += bytes;
-        self.enc += enc;
-        self.glass_to_send += capture_to_sent;
-    }
-
-    fn maybe_log(&mut self, target_kbps: u32) {
-        let el = self.since.elapsed();
-        if el < Duration::from_secs(5) || self.frames == 0 {
-            return;
-        }
-        let n = self.frames;
-        tracing::info!(
-            "host: {:.0} fps, {:.1} Mbit/s (target {:.1}), encode {:.1} ms, capture→sent {:.1} ms, {} keyframes",
-            f64::from(n) / el.as_secs_f64(),
-            self.bytes as f64 * 8.0 / el.as_secs_f64() / 1e6,
-            f64::from(target_kbps) / 1000.0,
-            self.enc.as_secs_f64() * 1000.0 / f64::from(n),
-            self.glass_to_send.as_secs_f64() * 1000.0 / f64::from(n),
-            self.keys
-        );
-        *self = Self::new();
-    }
 }
 
 fn hostname() -> String {

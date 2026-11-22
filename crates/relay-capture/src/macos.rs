@@ -134,8 +134,6 @@ struct Shared {
 
 struct Handler {
     shared: Arc<Shared>,
-    width: u32,
-    height: u32,
 }
 
 impl SCStreamOutputTrait for Handler {
@@ -151,6 +149,9 @@ impl SCStreamOutputTrait for Handler {
         let Some(pb) = sample.pixel_buffer() else {
             return;
         };
+        // Size from the buffer itself: it changes when the stream is
+        // re-scaled (ABR).
+        let (width, height) = (pb.width() as u32, pb.height() as u32);
         let dirty = info
             .dirty_rects
             .unwrap_or_default()
@@ -163,16 +164,16 @@ impl SCStreamOutputTrait for Handler {
             })
             .collect::<Vec<_>>();
         let frame = CapturedFrame {
-            width: self.width,
-            height: self.height,
+            width,
+            height,
             format: crate::PixelFormat::Nv12,
             data: FrameData::Native(Arc::new(MacFrame { pixel_buffer: pb })),
             dirty: if dirty.is_empty() {
                 vec![Rect {
                     x: 0,
                     y: 0,
-                    w: self.width,
-                    h: self.height,
+                    w: width,
+                    h: height,
                 }]
             } else {
                 dirty
@@ -203,6 +204,8 @@ pub struct SckCapturer {
     bounds: (f64, f64, f64, f64),
     cursor_img: Option<Arc<crate::CursorImage>>,
     cursor_polled: Option<Instant>,
+    /// Native pixel size of the selected display.
+    native: (u32, u32),
 }
 
 impl std::fmt::Debug for SckCapturer {
@@ -231,6 +234,7 @@ impl SckCapturer {
             bounds: (0.0, 0.0, 1.0, 1.0),
             cursor_img: None,
             cursor_polled: None,
+            native: (0, 0),
         }
     }
 
@@ -257,6 +261,14 @@ impl Drop for SckCapturer {
 }
 
 impl ScreenCapturer for SckCapturer {
+    fn set_scale(&mut self, scale: f32) -> Result<(u32, u32), CaptureError> {
+        self.rescale(scale)
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>, CaptureError> {
+        self.next_frame_impl(timeout)
+    }
+
     fn cursor(&mut self) -> Option<crate::CursorState> {
         // The image is comparatively costly to read; poll it at ~20 Hz.
         if self
@@ -328,19 +340,8 @@ impl ScreenCapturer for SckCapturer {
             .with_excluding_windows(&[])
             .build()
             .map_err(map_err)?;
-        let config = SCStreamConfiguration::new()
-            .with_width(w)
-            .with_height(h)
-            .with_pixel_format(screencapturekit::stream::configuration::PixelFormat::YCbCr_420v)
-            // The cursor travels on its own channel and the Controller
-            // draws it locally (§6 rule 5).
-            .with_shows_cursor(false)
-            .with_minimum_frame_interval(&CMTime::new(1, self.fps as i32))
-            .with_queue_depth(3)
-            // The viewer's shader assumes BT.709 limited range.
-            .with_color_matrix(screencapturekit::stream::configuration::color_matrix::ITU_R_709_2)
-            .map_err(map_err)?;
-
+        self.native = (w, h);
+        let config = Self::config(w, h, self.fps)?;
         *self.shared.slot.lock().expect("poisoned") = Slot::default();
         let mut stream =
             SCStream::new_with_delegate(&filter, &config, Delegate(self.shared.clone()))
@@ -349,8 +350,6 @@ impl ScreenCapturer for SckCapturer {
             .add_output_handler(
                 Handler {
                     shared: self.shared.clone(),
-                    width: w,
-                    height: h,
                 },
                 SCStreamOutputType::Screen,
             )
@@ -359,8 +358,42 @@ impl ScreenCapturer for SckCapturer {
         self.stream = Some(stream);
         Ok(())
     }
+}
 
-    fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>, CaptureError> {
+impl SckCapturer {
+    fn config(w: u32, h: u32, fps: u32) -> Result<SCStreamConfiguration, CaptureError> {
+        SCStreamConfiguration::new()
+            .with_width(w)
+            .with_height(h)
+            .with_pixel_format(screencapturekit::stream::configuration::PixelFormat::YCbCr_420v)
+            // The cursor travels on its own channel and the Controller
+            // draws it locally (§6 rule 5).
+            .with_shows_cursor(false)
+            .with_minimum_frame_interval(&CMTime::new(1, fps as i32))
+            .with_queue_depth(3)
+            // The viewer's shader assumes BT.709 limited range.
+            .with_color_matrix(screencapturekit::stream::configuration::color_matrix::ITU_R_709_2)
+            .map_err(map_err)
+    }
+}
+
+impl SckCapturer {
+    /// Re-size the running stream without restarting it.
+    fn rescale(&mut self, scale: f32) -> Result<(u32, u32), CaptureError> {
+        let (w, h) = crate::scaled_size(self.native, scale);
+        let stream = self.stream.as_ref().ok_or(CaptureError::NoSuchDisplay(0))?;
+        stream
+            .update_configuration(&Self::config(w, h, self.fps)?)
+            .map_err(map_err)?;
+        Ok((w, h))
+    }
+}
+
+impl SckCapturer {
+    fn next_frame_impl(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
         if self.stream.is_none() {
             return Err(CaptureError::NoSuchDisplay(0));
         }

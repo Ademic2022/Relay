@@ -100,6 +100,8 @@ pub trait Encoder: Send {
     fn config(&self) -> &EncoderConfig;
     /// Encode one frame. Synchronous and returns this frame's output
     /// directly: an encoder that buffers frames violates §6 rule 1.
+    /// Empty `data` means the rate controller skipped the frame; send
+    /// nothing for it.
     fn encode(
         &mut self,
         frame: &CapturedFrame,

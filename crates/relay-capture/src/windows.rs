@@ -281,7 +281,8 @@ struct Converter {
 }
 
 impl Converter {
-    fn new(dev: &D3dDevice, w: u32, h: u32) -> Result<Self, CaptureError> {
+    /// Converts `in_w`×`in_h` BGRA into `w`×`h` NV12, scaling on the way.
+    fn new(dev: &D3dDevice, in_w: u32, in_h: u32, w: u32, h: u32) -> Result<Self, CaptureError> {
         let vdev: ID3D11VideoDevice = dev.device.cast().map_err(plat)?;
         let vctx: ID3D11VideoContext = dev.with_context(|c| c.cast()).map_err(plat)?;
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
@@ -290,8 +291,8 @@ impl Converter {
                 Numerator: 60,
                 Denominator: 1,
             },
-            InputWidth: w,
-            InputHeight: h,
+            InputWidth: in_w,
+            InputHeight: in_h,
             OutputFrameRate: DXGI_RATIONAL {
                 Numerator: 60,
                 Denominator: 1,
@@ -421,6 +422,9 @@ struct Session {
     device: Arc<D3dDevice>,
     dup: IDXGIOutputDuplication,
     conv: Converter,
+    /// Desktop size (input) and encoded size (output, after ABR scaling).
+    in_w: u32,
+    in_h: u32,
     width: u32,
     height: u32,
     holding: bool,
@@ -432,6 +436,7 @@ pub struct DxgiCapturer {
     dirty_buf: Vec<RECT>,
     cursor: Option<CursorState>,
     shape_buf: Vec<u8>,
+    scale: f32,
 }
 
 // SAFETY: used from one thread at a time (&mut self); COM objects here are
@@ -460,6 +465,7 @@ impl DxgiCapturer {
             dirty_buf: Vec::new(),
             cursor: None,
             shape_buf: Vec::new(),
+            scale: 1.0,
         })
     }
 
@@ -480,13 +486,16 @@ impl DxgiCapturer {
                 plat(e)
             }
         })?;
-        let conv = Converter::new(&device, w, h)?;
+        let (ow, oh) = crate::scaled_size((w, h), self.scale);
+        let conv = Converter::new(&device, w, h, ow, oh)?;
         self.session = Some(Session {
             device,
             dup,
             conv,
-            width: w,
-            height: h,
+            in_w: w,
+            in_h: h,
+            width: ow,
+            height: oh,
             holding: false,
         });
         Ok(())
@@ -572,6 +581,19 @@ impl ScreenCapturer for DxgiCapturer {
         self.cursor.clone()
     }
 
+    fn set_scale(&mut self, scale: f32) -> Result<(u32, u32), CaptureError> {
+        self.scale = scale.clamp(0.1, 1.0);
+        let s = self
+            .session
+            .as_mut()
+            .ok_or(CaptureError::NoSuchDisplay(0))?;
+        let (w, h) = crate::scaled_size((s.in_w, s.in_h), self.scale);
+        s.conv = Converter::new(&s.device, s.in_w, s.in_h, w, h)?;
+        s.width = w;
+        s.height = h;
+        Ok((w, h))
+    }
+
     fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
         Ok(outputs()?.iter().map(display_info).collect())
     }
@@ -617,8 +639,8 @@ impl ScreenCapturer for DxgiCapturer {
                     image: None,
                 });
                 c.visible = p.Visible.as_bool();
-                c.x = p.Position.x as f32 / s.width.max(1) as f32;
-                c.y = p.Position.y as f32 / s.height.max(1) as f32;
+                c.x = p.Position.x as f32 / s.in_w.max(1) as f32;
+                c.y = p.Position.y as f32 / s.in_h.max(1) as f32;
                 if info.PointerShapeBufferSize > 0 {
                     self.shape_buf
                         .resize(info.PointerShapeBufferSize as usize, 0);

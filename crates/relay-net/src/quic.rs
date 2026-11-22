@@ -32,7 +32,7 @@ pub const SERVER_NAME: &str = "relay";
 /// Datagram send buffer. Small on purpose: when the path is congested,
 /// quinn drops the oldest queued datagrams instead of building latency
 /// (§6 rule 3). ~128 KB ≈ one 1080p keyframe at Speed-mode bitrates.
-const DATAGRAM_SEND_BUFFER: usize = 128 * 1024;
+pub const DATAGRAM_SEND_BUFFER: usize = 128 * 1024;
 const DATAGRAM_RECV_BUFFER: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]

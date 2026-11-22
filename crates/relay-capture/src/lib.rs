@@ -173,9 +173,20 @@ pub trait ScreenCapturer: Send {
     /// Start (or switch to) capturing `display_id`. Only that display is
     /// captured (FR-21).
     fn select(&mut self, display_id: u32) -> Result<(), CaptureError>;
+    /// Capture at `scale` × native resolution (ABR step 3, §6 rule 7).
+    /// Returns the new frame size (even dimensions).
+    fn set_scale(&mut self, _scale: f32) -> Result<(u32, u32), CaptureError> {
+        Err(CaptureError::Unsupported)
+    }
     /// Wait up to `timeout` for the next changed frame. `Ok(None)` means
     /// nothing changed (§6 rule 4: damage-driven capture).
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>, CaptureError>;
+}
+
+/// `native` × `scale`, rounded down to even numbers (≥ 2).
+pub fn scaled_size((w, h): (u32, u32), scale: f32) -> (u32, u32) {
+    let f = |v: u32| (((v as f32 * scale.clamp(0.1, 1.0)) as u32) & !1).max(2);
+    (f(w), f(h))
 }
 
 /// The default capturer for this OS.

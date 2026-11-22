@@ -16,11 +16,15 @@ pub const STRIPE_BLOCKS: usize = 32;
 
 #[derive(Debug)]
 pub struct PatternCapturer {
+    native: (u32, u32),
     width: u32,
     height: u32,
     fps: u32,
     next: Instant,
     n: u64,
+    /// Fill part of each frame with fresh noise: incompressible content
+    /// that makes the encoder hit its bitrate target (network tests).
+    pub noise: bool,
 }
 
 /// Wall-clock Unix time in ms, low 32 bits (wraps every ~49 days).
@@ -33,11 +37,13 @@ pub fn unix_ms32() -> u32 {
 impl PatternCapturer {
     pub fn new(width: u32, height: u32, fps: u32) -> Self {
         Self {
+            native: (width & !1, height & !1),
             width: width & !1,
             height: height & !1,
             fps: fps.max(1),
             next: Instant::now(),
             n: 0,
+            noise: false,
         }
     }
 }
@@ -78,6 +84,20 @@ pub fn draw(
         let v = if ms >> (31 - bit) & 1 == 1 { 235 } else { 16 };
         for row in 0..bh {
             y[row * ys + bit * bw..row * ys + (bit + 1) * bw].fill(v);
+        }
+    }
+}
+
+/// Overwrite a block (1/16 of the frame, below the stamp) with noise that
+/// changes every frame: a heavy moving region, like video in a window.
+pub fn add_noise(y: &mut [u8], ys: usize, w: usize, h: usize, n: u64) {
+    let mut x = (n as u32).wrapping_mul(2_654_435_761) | 1;
+    for row in h / 4..h / 2 {
+        for px in &mut y[row * ys + w / 4..row * ys + w / 2] {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *px = 16 + (x >> 24) as u8 % 220;
         }
     }
 }
@@ -125,7 +145,13 @@ impl NativeFrame for MemFrame {
 }
 
 #[cfg(target_os = "macos")]
-fn make_frame(w: usize, h: usize, n: u64, ms: u32) -> Result<Arc<dyn NativeFrame>, CaptureError> {
+fn make_frame(
+    w: usize,
+    h: usize,
+    n: u64,
+    ms: u32,
+    noise: bool,
+) -> Result<Arc<dyn NativeFrame>, CaptureError> {
     #![allow(unsafe_code)]
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     const FMT_420V: u32 = u32::from_be_bytes(*b"420v");
@@ -151,24 +177,71 @@ fn make_frame(w: usize, h: usize, n: u64, ms: u32) -> Result<Arc<dyn NativeFrame
             )
         };
         draw(y, ys, uv, uvs, w, h, n, ms);
+        if noise {
+            add_noise(y, ys, w, h, n);
+        }
     }
     Ok(Arc::new(crate::macos::MacFrame { pixel_buffer: pb }))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn make_frame(w: usize, h: usize, n: u64, ms: u32) -> Result<Arc<dyn NativeFrame>, CaptureError> {
-    let mut y = vec![0u8; w * h];
-    let mut uv = vec![0u8; w * h / 2];
-    draw(&mut y, w, &mut uv, w, w, h, n, ms);
-    Ok(Arc::new(MemFrame { w, h, y, uv }))
+fn make_frame(
+    w: usize,
+    h: usize,
+    n: u64,
+    ms: u32,
+    noise: bool,
+) -> Result<Arc<dyn NativeFrame>, CaptureError> {
+    Ok(mem_frame_with(w, h, n, ms, noise))
 }
 
 /// In-memory frame for tests on any OS.
 pub fn mem_frame(w: usize, h: usize, n: u64, ms: u32) -> Arc<dyn NativeFrame> {
+    mem_frame_with(w, h, n, ms, false)
+}
+
+fn mem_frame_with(w: usize, h: usize, n: u64, ms: u32, noise: bool) -> Arc<dyn NativeFrame> {
     let mut y = vec![0u8; w * h];
     let mut uv = vec![0u8; w * h / 2];
     draw(&mut y, w, &mut uv, w, w, h, n, ms);
+    if noise {
+        add_noise(&mut y, w, w, h, n);
+    }
     Arc::new(MemFrame { w, h, y, uv })
+}
+
+impl PatternCapturer {
+    /// Frames in system memory on every OS (for the software encoder in
+    /// tests), instead of IOSurfaces on macOS.
+    pub fn cpu_frames(self) -> CpuPattern {
+        CpuPattern(self)
+    }
+}
+
+/// [`PatternCapturer`] producing system-memory frames everywhere.
+#[derive(Debug)]
+pub struct CpuPattern(PatternCapturer);
+
+impl ScreenCapturer for CpuPattern {
+    fn displays(&self) -> Result<Vec<DisplayInfo>, CaptureError> {
+        self.0.displays()
+    }
+    fn select(&mut self, id: u32) -> Result<(), CaptureError> {
+        self.0.select(id)
+    }
+    fn set_scale(&mut self, scale: f32) -> Result<(u32, u32), CaptureError> {
+        self.0.set_scale(scale)
+    }
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>, CaptureError> {
+        let Some(mut f) = self.0.next_frame_with(timeout, |w, h, n, ms, noise| {
+            Ok(mem_frame_with(w, h, n, ms, noise))
+        })?
+        else {
+            return Ok(None);
+        };
+        f.format = PixelFormat::Nv12;
+        Ok(Some(f))
+    }
 }
 
 /// A 12x19 arrow, so the cursor channel can be exercised without a screen.
@@ -224,8 +297,8 @@ impl ScreenCapturer for PatternCapturer {
             name: "Test pattern".into(),
             x: 0,
             y: 0,
-            width: self.width,
-            height: self.height,
+            width: self.native.0,
+            height: self.native.1,
             scale: 1.0,
             primary: true,
         }])
@@ -238,7 +311,24 @@ impl ScreenCapturer for PatternCapturer {
         Ok(())
     }
 
+    fn set_scale(&mut self, scale: f32) -> Result<(u32, u32), CaptureError> {
+        let (w, h) = crate::scaled_size(self.native, scale);
+        self.width = w;
+        self.height = h;
+        Ok((w, h))
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>, CaptureError> {
+        self.next_frame_with(timeout, make_frame)
+    }
+}
+
+impl PatternCapturer {
+    fn next_frame_with(
+        &mut self,
+        timeout: Duration,
+        make: impl FnOnce(usize, usize, u64, u32, bool) -> Result<Arc<dyn NativeFrame>, CaptureError>,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
         let now = Instant::now();
         if self.next > now {
             let wait = self.next - now;
@@ -255,7 +345,7 @@ impl ScreenCapturer for PatternCapturer {
         let captured_at = Instant::now();
         let ms = unix_ms32();
         let (w, h) = (self.width as usize, self.height as usize);
-        let data = make_frame(w, h, self.n, ms)?;
+        let data = make(w, h, self.n, ms, self.noise)?;
         self.n += 1;
         Ok(Some(CapturedFrame {
             width: self.width,

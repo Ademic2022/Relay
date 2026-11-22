@@ -14,7 +14,8 @@ Built milestone by milestone (PRD §12).
 | M1 LAN screen view | macOS host + viewer working; Windows capture (DXGI) + encoder (Media Foundation) written, never run; acceptance not yet run on two machines |
 | M2 Remote control | mouse, keyboard (HID scancodes), scroll, ⌘/Ctrl mapping, HiDPI mapping, cursor channel written; not yet tried by hand |
 | M3 Internet connectivity | rendezvous + relay server, device keys/IDs, mutual TLS, OPAQUE, hole punching, relay fallback, consent prompt, live relay→P2P switch; tested on localhost, not yet across two networks |
-| M4–M8 | not started |
+| M4 Adaptive streaming | FEC (Reed-Solomon), full ABR ladder (bitrate → fps → resolution), quality modes, stats overlay, network-emulation acceptance tests passing |
+| M5–M8 | not started |
 
 ## Layout
 
@@ -22,11 +23,11 @@ Built milestone by milestone (PRD §12).
 |---|---|
 | `relay-proto` | protobuf wire protocol (`proto/relay.proto`), length-delimited codec with size cap |
 | `relay-crypto` | Ed25519 device keys, 9-digit Device IDs, OS keystore, one-time / permanent passwords, OPAQUE |
-| `relay-net` | QUIC endpoints with device-key mutual TLS, shared UDP socket for punch/relay control packets, channel map, video framing |
+| `relay-net` | QUIC endpoints with device-key mutual TLS, shared UDP socket for punch/relay control packets, video framing with Reed-Solomon FEC, network emulator |
 | `relay-capture` | `ScreenCapturer` trait; ScreenCaptureKit (macOS); DXGI Desktop Duplication + GPU NV12 conversion (Windows); test pattern |
 | `relay-codec` | `Encoder` / `Decoder` traits; VideoToolbox (macOS) and Media Foundation (Windows) hardware encoders; openh264 software encoder/decoder |
 | `relay-input` | input model (USB HID usages + macOS/Windows key tables), ⌘/Ctrl mapping, HiDPI mapping; CGEvent (macOS) and SendInput (Windows) injectors |
-| `relay-session` | newest-wins channel, ABR controller, IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
+| `relay-session` | newest-wins channel, ABR controller, congestion-aware IDR limiter, brute-force limiter, Host session state machine (consent, banner, audit) |
 | `relay-render` | viewer present-mode policy (wgpu viewer in M1) |
 | `relay-service` | unattended-access agent targets (service in M7) |
 | `relay-server` | rendezvous (Device IDs, lookup, punch coordination) + blind UDP relay; Dockerfile |
@@ -72,11 +73,20 @@ pins each host's key and refuses a changed one (`relay forget <ID>` after a rein
 password is checked with OPAQUE, bound to the TLS session, so neither the server, the relay
 nor the network ever sees it. Five failed attempts lock a source out for 1 minute, doubling.
 
-Viewer keys: `Ctrl+Alt+Enter` full screen. `--no-cmd-ctrl-swap`, `--translate-chars`,
+Viewer keys: `Ctrl+Alt+Enter` full screen, `Ctrl+Alt+S` stats overlay, `Ctrl+Alt+Q` cycles the
+quality mode (Speed / Balanced / Quality; `--quality` sets the start). `--no-cmd-ctrl-swap`, `--translate-chars`,
 `--measure` (latency, with `--test-pattern` on the host). OS-reserved shortcuts (⌘Tab,
 Ctrl+Alt+Del) are not captured yet. `RELAY_KEYSTORE=memory` uses a throwaway device key.
 
 On Windows, allow `relay.exe` through Windows Firewall.
+
+## Network-emulation tests (M4)
+
+`cargo test -p relay-app netem -- --nocapture` runs the real sender, transport, FEC and decoder
+through an emulated link and prints what happened:
+
+- 2% loss, 50 ms RTT: no freeze over 300 ms (measured ~70 ms), latency p95 ~45 ms.
+- 1 Mbit/s bottleneck: settles at ~0.8 Mbit/s, half resolution, 20+ fps, latency p95 under 100 ms.
 
 ## Build and test
 

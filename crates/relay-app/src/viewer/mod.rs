@@ -20,13 +20,14 @@ use relay_proto::v1::{self, control_message::Msg};
 use relay_session::latest;
 use tokio::sync::mpsc as tmpsc;
 
-use crate::clock;
-
 mod keys;
+mod overlay;
 mod render;
 
-/// How long a partially received frame may wait for missing slices.
-const REASSEMBLY_DEADLINE: Duration = Duration::from_millis(60);
+/// How long a partially received frame may wait for missing slices. Long
+/// enough for a big keyframe to cross a slow link; it adds no latency,
+/// because any newer complete frame replaces it at once (§6 rule 3).
+const REASSEMBLY_DEADLINE: Duration = Duration::from_millis(500);
 /// Encoded frames queued for the decoder before we give up and resync.
 const DECODE_QUEUE: usize = 6;
 
@@ -48,6 +49,9 @@ pub struct LiveStats {
     pub dropped: u64,
     pub rtt_ms: f64,
     pub path: &'static str,
+    pub loss_pct: f64,
+    pub recovered: u64,
+    pub queue_ms: f64,
 }
 
 pub struct Shared {
@@ -66,6 +70,8 @@ pub struct HostInfo {
 
 #[derive(Debug, Clone)]
 pub struct ViewOptions {
+    /// Initial quality mode (FR-19, §6 rule 10).
+    pub quality: v1::QualityMode,
     pub target: Target,
     pub password: String,
     pub force_relay: bool,
@@ -93,6 +99,8 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
     // Input from the window to the network. Unbounded: events are tiny and
     // must never be dropped or block the UI thread.
     let (input_tx, input_rx) = tmpsc::unbounded_channel::<v1::InputEvent>();
+    // Control messages from the window (quality mode).
+    let (ui_tx, ui_rx) = tmpsc::unbounded_channel::<v1::ControlMessage>();
 
     let net = {
         let proxy = proxy.clone();
@@ -117,6 +125,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
                     shared,
                     quit_rx,
                     input_rx,
+                    ui_rx,
                 ));
                 let msg = match res {
                     Ok(m) => m,
@@ -126,7 +135,7 @@ pub fn run(opts: ViewOptions) -> anyhow::Result<()> {
             })?
     };
 
-    let mut app = render::App::new(shared, quit_tx, input_tx, &opts);
+    let mut app = render::App::new(shared, quit_tx, input_tx, ui_tx, &opts);
     event_loop.run_app(&mut app)?;
     let _ = net.join();
     if let Some(msg) = app.close_reason() {
@@ -245,6 +254,7 @@ async fn network(
         target,
         password,
         force_relay,
+        quality,
         ..
     }: ViewOptions,
     frames_out: latest::Sender<DecodedFrame>,
@@ -252,6 +262,7 @@ async fn network(
     shared: Arc<Shared>,
     mut quit: tokio::sync::oneshot::Receiver<()>,
     mut input_rx: tmpsc::UnboundedReceiver<v1::InputEvent>,
+    mut ui_rx: tmpsc::UnboundedReceiver<v1::ControlMessage>,
 ) -> anyhow::Result<String> {
     let _ = proxy.send_event(UserEvent::Status(format!("Connecting to {}…", target)));
     let me = crate::identity::load()?;
@@ -318,6 +329,23 @@ async fn network(
         }
         let _ = tx.finish();
     });
+
+    // Window → host control messages; start in the requested mode.
+    if quality != v1::QualityMode::Speed {
+        let _ = ctl_tx.send(control(Msg::SetQuality(v1::SetQuality {
+            mode: quality as i32,
+        })));
+    }
+    let ui_forward = {
+        let ctl = ctl_tx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = ui_rx.recv().await {
+                if ctl.send(m).is_err() {
+                    break;
+                }
+            }
+        })
+    };
 
     // Input: its own unidirectional stream at top priority (§6 rule 8),
     // so it is never queued behind other stream data.
@@ -424,6 +452,7 @@ async fn network(
     drop(ctl_tx);
     input_writer.abort();
     streams.abort();
+    ui_forward.abort();
     let _ = tokio::time::timeout(Duration::from_millis(300), writer).await;
     conn.close(0u32.into(), b"viewer closed");
     let _ = tokio::task::spawn_blocking(move || decoder.join()).await;
@@ -442,7 +471,7 @@ async fn receive(
     switched: &tokio::sync::Notify,
 ) -> String {
     let mut reasm = Reassembler::new(REASSEMBLY_DEADLINE);
-    let mut fb = Feedback::new();
+    let mut fb = crate::feedback::Feedback::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut need_key = false;
     loop {
@@ -454,11 +483,11 @@ async fn receive(
                 };
                 let now = Instant::now();
                 fb.bytes += dg.len();
+                fb.on_datagram(&dg);
                 let Some(frame) = ({
                     let _s = tracing::trace_span!("reassemble").entered();
                     reasm.push(dg, now)
                 }) else { continue };
-                fb.on_frame(frame.capture_ts_us);
                 if need_key && !frame.is_key {
                     continue; // waiting for the requested keyframe
                 }
@@ -480,11 +509,14 @@ async fn receive(
             _ = tick.tick() => {
                 reasm.expire(Instant::now());
                 let st = reasm.stats();
-                let report = fb.report(st.frames_delivered, st.frames_dropped);
+                let report = fb.report(&st);
                 {
                     let mut s = shared.stats.lock().expect("poisoned");
                     s.mbps = f64::from(report.receive_kbps) / 1000.0;
                     s.dropped = st.frames_dropped;
+                    s.recovered = st.frames_recovered;
+                    s.loss_pct = f64::from(report.loss_permille) / 10.0;
+                    s.queue_ms = f64::from(report.delay_trend_us.max(0)) / 1000.0;
                     s.rtt_ms = conn.rtt().as_secs_f64() * 1000.0;
                 }
                 let _ = ctl.send(control(Msg::AbrFeedback(report)));
@@ -558,68 +590,6 @@ fn decode_loop(
                 0.0
             };
             (n, total, since) = (0, Duration::ZERO, Instant::now());
-        }
-    }
-}
-
-/// Builds the 100 ms ABR report (§6 rule 7).
-///
-/// One-way delay is measured as `arrival - capture_ts`. The clocks are not
-/// synchronised, so the absolute value is meaningless, but its growth
-/// above the recent minimum is queueing delay.
-struct Feedback {
-    bytes: usize,
-    since: Instant,
-    window_min: Option<i64>,
-    history: std::collections::VecDeque<i64>,
-    last_delivered: u64,
-    last_dropped: u64,
-}
-
-impl Feedback {
-    const BASELINE_WINDOWS: usize = 50; // 5 s
-
-    fn new() -> Self {
-        Self {
-            bytes: 0,
-            since: Instant::now(),
-            window_min: None,
-            history: Default::default(),
-            last_delivered: 0,
-            last_dropped: 0,
-        }
-    }
-
-    fn on_frame(&mut self, capture_ts_us: u64) {
-        let owd = clock::now_us() as i64 - capture_ts_us as i64;
-        self.window_min = Some(self.window_min.map_or(owd, |m| m.min(owd)));
-    }
-
-    fn report(&mut self, delivered: u64, dropped: u64) -> v1::AbrFeedback {
-        let el = self.since.elapsed().as_secs_f64().max(1e-3);
-        let receive_kbps = (self.bytes as f64 * 8.0 / el / 1000.0) as u32;
-        let d_del = delivered - self.last_delivered;
-        let d_drop = dropped - self.last_dropped;
-        let loss_permille = (d_drop * 1000).checked_div(d_del + d_drop).unwrap_or(0) as u32;
-        let mut delay_trend_us = 0;
-        if let Some(m) = self.window_min.take() {
-            let baseline = self.history.iter().copied().min().unwrap_or(m).min(m);
-            delay_trend_us = i32::try_from(m - baseline).unwrap_or(i32::MAX);
-            self.history.push_back(m);
-            if self.history.len() > Self::BASELINE_WINDOWS {
-                self.history.pop_front();
-            }
-        }
-        self.bytes = 0;
-        self.since = Instant::now();
-        self.last_delivered = delivered;
-        self.last_dropped = dropped;
-        v1::AbrFeedback {
-            receive_kbps,
-            loss_permille,
-            delay_trend_us,
-            decode_time_us: 0,
-            frames_dropped: d_drop as u32,
         }
     }
 }

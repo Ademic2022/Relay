@@ -65,3 +65,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Codecs are slow unoptimised; keep debug builds and tests realistic.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3

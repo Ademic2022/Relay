@@ -13,11 +13,12 @@ relay-capture.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 openh264 = { workspace = true, optional = true }
+openh264-sys2 = { version = "0.9.10", optional = true }
 
 [features]
 default = ["openh264"]
 # Software H.264 fallback (C++; needs a native toolchain).
-openh264 = ["dep:openh264"]
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }

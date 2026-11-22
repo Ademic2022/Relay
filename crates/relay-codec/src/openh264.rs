@@ -5,6 +5,8 @@
 //! decoded planes out. Those copies are inherent to software coding and
 //! are why hardware codecs are the default (§6 rule 2).
 
+#![allow(unsafe_code)] // one raw SetOption call for live bitrate changes
+
 use ::openh264::OpenH264API;
 use ::openh264::decoder::{Decoder as OhDecoder, DecoderConfig};
 use ::openh264::encoder::{
@@ -20,6 +22,9 @@ use crate::*;
 pub struct OpenH264Encoder {
     config: EncoderConfig,
     enc: OhEncoder,
+    /// openh264 initialises on the first encode; options before that go
+    /// into the config instead.
+    started: bool,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
@@ -42,7 +47,11 @@ fn oh_config(c: &EncoderConfig) -> OhConfig {
         .max_frame_rate(FrameRate::from_hz(c.fps as f32))
         // No periodic IDR: keyframes only on request (§6 rule 6).
         .intra_frame_period(IntraFramePeriod::from_num_frames(0))
-        .skip_frames(false)
+        // openh264 only enforces the bitrate with frame skipping on. A
+        // skipped frame comes back empty and is simply not sent.
+        .skip_frames(true)
+        // Keyframes only on request (§6 rule 6), never on "scene change".
+        .scene_change_detect(false)
         .complexity(Complexity::Low)
         .num_threads(0)
 }
@@ -57,6 +66,7 @@ impl OpenH264Encoder {
         Ok(Self {
             config,
             enc,
+            started: false,
             y: Vec::new(),
             u: Vec::new(),
             v: Vec::new(),
@@ -117,9 +127,13 @@ impl Encoder for OpenH264Encoder {
             .enc
             .encode(&src)
             .map_err(|e| CodecError::Platform(e.to_string()))?;
-        let is_key = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
+        self.started = true;
+        // Only an IDR lets a decoder (re)join; plain I-frames do not.
+        let is_key = matches!(bs.frame_type(), FrameType::IDR);
         self.out.clear();
-        bs.write_vec(&mut self.out);
+        if !matches!(bs.frame_type(), FrameType::Skip) {
+            bs.write_vec(&mut self.out);
+        }
         Ok(EncodedFrame {
             data: Bytes::copy_from_slice(&self.out),
             is_key,
@@ -131,11 +145,63 @@ impl Encoder for OpenH264Encoder {
         if kbps == self.config.bitrate_kbps {
             return Ok(());
         }
+        let old_kbps = self.config.bitrate_kbps;
         self.config.bitrate_kbps = kbps;
-        // openh264's safe API has no live bitrate setter; rebuilding costs
-        // one keyframe. ABR changes are rate-limited by the caller.
-        self.enc = OhEncoder::with_api_config(OpenH264API::from_source(), oh_config(&self.config))
-            .map_err(|e| CodecError::Platform(e.to_string()))?;
+        if !self.started {
+            // Not initialised yet: rebuild with the new config (cheap; no
+            // frame has been produced).
+            self.enc =
+                OhEncoder::with_api_config(OpenH264API::from_source(), oh_config(&self.config))
+                    .map_err(|e| CodecError::Platform(e.to_string()))?;
+            return Ok(());
+        }
+        // Live change through SetOption: no keyframe, no rebuild. The safe
+        // API has no setter, hence the raw call.
+        let bps = i32::try_from(kbps.saturating_mul(1000)).unwrap_or(i32::MAX);
+        // openh264 rejects a target above the layer's maximum, so raise
+        // the maximum first (layer 0 and total; a little headroom for
+        // rate-control overshoot), then set the target.
+        // openh264 checks target ≤ max on every call, so the order depends
+        // on the direction of the change.
+        let max = bps.saturating_add(bps / 4);
+        let max0 = (
+            openh264_sys2::ENCODER_OPTION_MAX_BITRATE,
+            openh264_sys2::SPATIAL_LAYER_0,
+            max,
+        );
+        let max_all = (
+            openh264_sys2::ENCODER_OPTION_MAX_BITRATE,
+            openh264_sys2::SPATIAL_LAYER_ALL,
+            max,
+        );
+        let target = (
+            openh264_sys2::ENCODER_OPTION_BITRATE,
+            openh264_sys2::SPATIAL_LAYER_ALL,
+            bps,
+        );
+        let steps = if kbps > old_kbps {
+            [max0, max_all, target]
+        } else {
+            [target, max0, max_all]
+        };
+        for (option, layer, value) in steps {
+            let mut info = openh264_sys2::SBitrateInfo {
+                iLayer: layer,
+                iBitrate: value,
+            };
+            // SAFETY: valid option id and pointer to a properly typed
+            // struct; the encoder is initialised (`started`).
+            let rc = unsafe {
+                self.enc
+                    .raw_api()
+                    .set_option(option, (&raw mut info).cast())
+            };
+            if rc != 0 {
+                return Err(CodecError::Platform(format!(
+                    "openh264 SetOption({option}) = {rc}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -270,6 +336,71 @@ mod tests {
         }
         assert_eq!(decoded, 10, "low-latency decoder outputs every frame");
         assert!(enc.encode(&frame(320, 240, 0), 99, true).unwrap().is_key);
+    }
+
+    #[test]
+    fn live_bitrate_change_without_keyframe() {
+        // Incompressible content so output size tracks the target.
+        let noisy = |n: usize| {
+            let (w, h) = (320usize, 240usize);
+            let mut x = (n as u32 + 1).wrapping_mul(2_654_435_761);
+            // Static gradient with a changing 96x96 noise block: screen-like
+            // (mostly unchanged), yet expensive enough to follow the target.
+            let y: Vec<u8> = (0..w * h)
+                .map(|i| {
+                    let (col, row) = (i % w, i / w);
+                    if (100..196).contains(&col) && (70..166).contains(&row) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        (x >> 24) as u8
+                    } else {
+                        (col / 2) as u8
+                    }
+                })
+                .collect();
+            CapturedFrame {
+                width: w as u32,
+                height: h as u32,
+                format: PixelFormat::Nv12,
+                data: FrameData::Native(Arc::new(TestFrame {
+                    w,
+                    h,
+                    y,
+                    uv: vec![128; w * h / 2],
+                })),
+                dirty: vec![],
+                captured_at: Instant::now(),
+            }
+        };
+        let mut enc =
+            OpenH264Encoder::new(EncoderConfig::low_latency(Codec::H264, 320, 240, 30, 4_000))
+                .unwrap();
+        enc.set_bitrate(4_100).unwrap(); // before the first frame: must not fail
+        let avg = |enc: &mut OpenH264Encoder, from: usize| -> (usize, u32) {
+            let mut bytes = 0;
+            let mut keys = 0;
+            for n in from..from + 30 {
+                let e = enc.encode(&noisy(n), n as u64, false).unwrap();
+                bytes += e.data.len();
+                keys += u32::from(e.is_key);
+            }
+            (bytes / 30, keys)
+        };
+        let (_, k0) = avg(&mut enc, 0);
+        let (high, k1) = avg(&mut enc, 30);
+        enc.set_bitrate(500).unwrap();
+        let (low, keys) = avg(&mut enc, 60);
+        assert_eq!((k0, k1), (1, 0), "only the first frame is an IDR");
+        assert_eq!(keys, 0, "no keyframe from a bitrate change");
+        assert!(
+            low * 2 < high,
+            "output follows the new target: {high} → {low} bytes/frame"
+        );
+        enc.set_bitrate(6_000).unwrap(); // raising past the initial rate works too
+        let (higher, keys) = avg(&mut enc, 90);
+        assert_eq!(keys, 0);
+        assert!(higher > low * 2, "{low} → {higher}");
     }
 }
 

@@ -7,6 +7,7 @@
 pub mod channel;
 pub mod ctl;
 pub mod demux;
+pub mod netem;
 pub mod quic;
 pub mod tls;
 pub mod video;

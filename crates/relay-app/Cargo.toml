@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 wgpu = "30"
 winit = "0.30"
 pollster = "0.4"
+font8x8 = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }

@@ -45,7 +45,7 @@ fn frames_flow_and_loss_triggers_rate_limited_idr() {
             is_key: e.is_key,
             capture_ts_us: e.capture_ts_us,
         };
-        for (i, dg) in slice_frame(meta, &e.data, DEFAULT_MAX_DATAGRAM)
+        for (i, dg) in slice_frame(meta, &e.data, DEFAULT_MAX_DATAGRAM, 0)
             .unwrap()
             .into_iter()
             .enumerate()
