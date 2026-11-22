@@ -1,7 +1,7 @@
 # Build Relay-<version>.msi (PRD §12 M8, §10 Windows).
 #
-# Requires: Rust (MSVC), WiX v4+ (`dotnet tool install --global wix`;
-#           `wix extension add -g WixToolset.Firewall.wixext`).
+# Requires: Rust (MSVC), WiX 5.0.2 (`dotnet tool install --global wix --version 5.0.2`;
+#           `wix extension add -g WixToolset.Firewall.wixext/5.0.2`).
 # Optional signing (EV certificate strongly recommended, §10):
 #   $env:WINDOWS_SIGN_THUMBPRINT   certificate thumbprint in the cert store
 #   $env:WINDOWS_TIMESTAMP_URL     RFC 3161 timestamp server (default DigiCert)

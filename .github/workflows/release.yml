@@ -73,10 +73,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Pinned: newer WiX majors change the CLI and require accepting an
+      # extra EULA; the extension must match the tool's version.
       - name: WiX
         run: |
-          dotnet tool install --global wix
-          wix extension add -g WixToolset.Firewall.wixext
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Firewall.wixext/5.0.2
       - name: Import signing certificate
         if: env.HAS_CERT == 'true'
         shell: pwsh
